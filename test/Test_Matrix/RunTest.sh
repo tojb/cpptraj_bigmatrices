@@ -46,16 +46,29 @@ DoTest mtest.dat.12.save mtest.12.dat
 DoTest mtest.dat.13.save mtest.13.dat
 DoTest mtest.gnu.14.save mtest.14.gnu
 
-# Test reading symmetric matrix
-# NOTE: Currently disabled due to eigenvector sign flips causing false test errors.
-ReadSymmMatrix() {
+
+# Test to read and diagnoalise a symmetric matrix
+# need to faff around and make sure that eigenvector comparison is sign-free
 cat > matrix.in <<EOF
 readdata mtest.dat.10.save name MyMatrix read2d
 diagmatrix MyMatrix out evecs.10.dat vecs 3
 EOF
-RunCpptraj "Read symmetric matrix data test."
-DoTest evecs.10.dat.save evecs.10.dat
-}
+RunCpptraj "Diagonalise symmetric matrix test."
+sed 's/-/ /g'  evecs.10.dat.save > evref_signfree.dat
+sed 's/-/ /g'  evecs.10.dat      > ev_signfree.dat
+DoTest evref_signfree.dat ev_signfree.dat
+
+# Test to read and diagnoalise a "big" symmetric matrix with checkpointing
+cat > matrix.in <<EOF
+readdata mtest.dat.10.save name MyMatrix read2d
+diagmatrix MyMatrix checkpoint out evecs.11.dat vecs 3
+EOF
+RunCpptraj "Restartable/checkpointed diagonalise symmetric matrix test."
+sed 's/-/ /g'  evecs.10.dat.save > evref_signfree.dat
+sed 's/-/ /g'  evecs.11.dat      > ev2_signfree.dat
+DoTest evref_signfree.dat ev2_signfree.dat
+
+
 
 # Test start/stop/offset args
 UNITNAME='Generate matrix with start/stop/offset tests'
