@@ -51,7 +51,7 @@ DoTest mtest.gnu.14.save mtest.14.gnu
 # need to faff around and make sure that eigenvector comparison is sign-free
 cat > matrix.in <<EOF
 readdata mtest.dat.10.save name MyMatrix read2d
-diagmatrix MyMatrix out evecs.10.dat vecs 3
+diagmatrix MyMatrix out evecs.10.dat vecs 12 
 EOF
 RunCpptraj "Diagonalise symmetric matrix test."
 sed 's/-/ /g'  evecs.10.dat.save > evref_signfree.dat
@@ -61,7 +61,7 @@ DoTest evref_signfree.dat ev_signfree.dat
 # Test to read and diagnoalise a "big" symmetric matrix with checkpointing
 cat > matrix.in <<EOF
 readdata mtest.dat.10.save name MyMatrix read2d
-diagmatrix MyMatrix checkpoint out evecs.11.dat vecs 3
+diagmatrix MyMatrix checkpoint out evecs.11.dat vecs 12
 EOF
 RunCpptraj "Restartable/checkpointed diagonalise symmetric matrix test."
 sed 's/-/ /g'  evecs.10.dat.save > evref_signfree.dat

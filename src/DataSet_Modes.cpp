@@ -5,8 +5,11 @@
 #include "DataSet_2D.h"
 #include "DataSet_MatrixDbl.h"
 #include "Frame.h"
+#include "ProgressBar.h"
 #include <cmath> // sqrt, fabs
 #include <algorithm> // std::sort
+#include <cstdio>
+#include <ctime> // time, localtime, strftime
 
 #ifndef NO_MATHLIB
 // Definition of Fortran subroutines called from this class
@@ -363,6 +366,21 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
     double* mat = mIn.MatrixArray();
     // LOOP
     bool loop = false;
+    // Progress tracking: use ARPACK's max-iteration iparam[2] as a guide.
+    // iparam[5] (1-based) -> iparam[4] (0-based) is NCONV: number of converged Ritz values.
+    // iparam[9] (1-based) -> iparam[8] (0-based) is NUMOP: total number of OP*x (matrix-vector products).
+    ProgressBar progress( iparam[2] );
+    int last_nconv = 0;
+    // Attempt to load checkpoint if enabled
+    if (checkpointEnabled_) {
+      int nconv_loaded = CheckpointLoad(nelem, ncv, lworkl,
+                                        ido, iparam, ipntr, resid, eigenvectors,
+                                        workd, workl, evalues_);
+      if (nconv_loaded > 0) {
+        last_nconv = nconv_loaded;
+        loop = (ido == -1 || ido == 1); // Set loop based on restored ido
+      }
+    }
     do {
       if (loop) {
         // Dot products
@@ -383,6 +401,27 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
               ncv, eigenvectors, nelem, iparam, ipntr, workd, workl,
               lworkl, info);
       loop = (ido == -1 || ido == 1);
+
+      // Compute residual norm (resid is length nelem). This gives an
+      // inexpensive indicator of the current subspace quality.
+      double rnorm = 0.0;
+      for (int ri = 0; ri < nelem; ++ri) 
+          rnorm += resid[ri] * resid[ri];
+      rnorm = std::sqrt( rnorm );
+      // Use iparam[8] (0-based) for matrix-vector product count and iparam[4]
+      // for number of converged Ritz values.
+      int mvprod = (iparam[8] >= 0 ? iparam[8] : -1);
+      int nconv  = (iparam[4] >= 0 ? iparam[4] : 0);
+      if (mvprod >= 0) progress.Update( mvprod );
+      // Print only when a new mode (Ritz value) has converged.
+      if (nconv > last_nconv) {
+        mprintf("\tArnoldi: found %d modes (resid_norm=%.6e, mv=%d)\n", nconv, rnorm, mvprod);
+        // Save checkpoint on progress
+        CheckpointSave(nelem, ncv, lworkl, ido, iparam, ipntr, resid,
+                       eigenvectors, workd, workl, evalues_);
+        last_nconv = nconv;
+      }
+
     } while ( loop ); // END LOOP
 
     if (info != 0) {
@@ -397,6 +436,10 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
               ncv, eigenvectors, nelem, iparam, ipntr, workd, workl,
               lworkl, info);
       delete[] select;
+      // If checkpointing was used and we converged successfully, remove checkpoint file
+      if (info == 0) {
+        CheckpointDelete();
+      }
     } 
     delete[] mat;
     delete[] workl;
@@ -540,6 +583,179 @@ void DataSet_Modes::MultiplyEvecByFac(int nvec, double fac) {
   double* evec = evectors_ + (nvec * vecsize_);
   for (int jj = 0; jj < vecsize_; jj++)
     evec[jj] *= fac;
+}
+
+// DataSet_Modes::CheckpointLoad()
+// Attempt to load checkpoint state from file during Arnoldi iteration.
+// Returns: number of converged modes on success, 0 or negative on failure.
+// Sets ido to the saved reverse-communication flag.
+// Note: File I/O only on master rank in MPI; OpenMP-safe (serial I/O).
+int DataSet_Modes::CheckpointLoad(int nelem, int ncv, int lworkl,
+                                  int& ido, int* iparam, int* ipntr, double* resid, double* eigenvectors,
+                                  double* workd, double* workl, double* evalues_)
+{
+  if (!checkpointEnabled_) return 0;
+
+#ifdef MPI
+  // Only master rank reads checkpoint file to avoid I/O conflicts
+  if (!Parallel::World().Master()) return 0;
+#endif
+  
+  FileName const& chkfn = checkpointFile_;
+  if (chkfn.empty() || !File::Exists(chkfn)) return 0;
+  
+  FILE* f = fopen(chkfn.Full().c_str(), "rb");
+  if (!f) {
+    mprintf("\tNo existing checkpoint '%s' for reading.\n", chkfn.Full().c_str());
+    return -1;
+  }
+  
+  // Read human-readable header (text line starting with '#')
+  char header_line[256] = {0};
+  int c;
+  int idx = 0;
+  while ((c = fgetc(f)) != '\n' && c != EOF && idx < 255) {
+    header_line[idx++] = (char)c;
+  }
+  header_line[idx] = '\0';
+  
+  char magic[8] = {0};
+  if ((size_t)7 != fread(magic, 1, 7, f)) {
+    mprintf("\tCheckpoint '%s': failed to read magic.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  int version = 0;
+  if ((size_t)1 != fread(&version, sizeof(int), 1, f)) {
+    mprintf("\tCheckpoint '%s': failed to read version.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  int nelem_chk = 0, ncv_chk = 0, nmodes_chk = 0;
+  if ((size_t)1 != fread(&nelem_chk, sizeof(int), 1, f) ||
+      (size_t)1 != fread(&ncv_chk, sizeof(int), 1, f) ||
+      (size_t)1 != fread(&nmodes_chk, sizeof(int), 1, f)) {
+    mprintf("\tCheckpoint '%s': failed to read sizes.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  if (nelem_chk != nelem || ncv_chk != ncv) {
+    mprintf("\tCheckpoint '%s' incompatible (sizes differ); ignoring.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  if ((size_t)1 != fread(&ido, sizeof(int), 1, f) ||
+      (size_t)11 != fread(iparam, sizeof(int), 11, f) ||
+      (size_t)11 != fread(ipntr, sizeof(int), 11, f)) {
+    mprintf("\tCheckpoint '%s': failed to read ido/iparam/ipntr.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  if ((size_t)nelem != fread(resid, sizeof(double), nelem, f) ||
+      (size_t)(ncv * nelem) != fread(eigenvectors, sizeof(double), ncv * nelem, f) ||
+      (size_t)(3 * nelem) != fread(workd, sizeof(double), 3 * nelem, f) ||
+      (size_t)lworkl != fread(workl, sizeof(double), lworkl, f) ||
+      (size_t)nelem != fread(evalues_, sizeof(double), nelem, f)) {
+    mprintf("\tCheckpoint '%s': failed to read workspace arrays.\n", chkfn.Full().c_str());
+    fclose(f);
+    return 0;
+  }
+  
+  fclose(f);
+  
+  int nconv = (iparam[4] >= 0 ? iparam[4] : 0);
+  mprintf("\tLoaded checkpoint '%s'\n\t  %s\n\t  ido=%d, mv=%d\n",
+          chkfn.Full().c_str(), header_line, ido,
+          (iparam[8] >= 0 ? iparam[8] : -1));
+  
+  return nconv;
+}
+
+// DataSet_Modes::CheckpointSave()
+// Save checkpoint state to file during Arnoldi iteration.
+// Note: File I/O only on master rank in MPI; OpenMP-safe (serial I/O);
+//       Compatible with any LAPACK/BLAS backend (MKL, OpenBLAS, etc.)
+void DataSet_Modes::CheckpointSave(int nelem, int ncv, int lworkl, int ido,
+                                   const int* iparam, const int* ipntr, const double* resid,
+                                   const double* eigenvectors, const double* workd,
+                                   const double* workl, const double* evalues_)
+{
+  if (!checkpointEnabled_) return;
+
+#ifdef MPI
+  // Only master rank writes checkpoint file to avoid I/O conflicts
+  if (!Parallel::World().Master()) return;
+#endif
+  
+  FileName const& chkfn = checkpointFile_;
+  if (chkfn.empty()) return;
+  
+  FILE* f = fopen(chkfn.Full().c_str(), "wb");
+  if (!f) {
+    mprintf("\tFailed to open checkpoint '%s' for writing.\n", chkfn.Full().c_str());
+    return;
+  }
+  
+  // Write human-readable header line with metadata
+  time_t now = time(0);
+  struct tm* loctime = localtime(&now);
+  char time_str[32];
+  strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", loctime);
+  int nconv = (iparam[4] >= 0 ? iparam[4] : 0);
+  int mvprod = (iparam[8] >= 0 ? iparam[8] : -1);
+  int iter = (iparam[2] >= 0 ? iparam[2] : -1);
+  fprintf(f, "# Arnoldi checkpoint: %s | modes=%d converged=%d iter=%d mv=%d ido=%d\n",
+          time_str, nmodes_, nconv, iter, mvprod, ido);
+  
+  // Binary checkpoint format: magic, version, sizes, ido, iparam, ipntr, resid, eigenvectors, workd, workl, evalues_
+  const char* magic = "ARPKCHK";
+  bool write_ok = true;
+  if ((size_t)7 != fwrite(magic, 1, 7, f)) write_ok = false;
+  int version = 1;
+  if ((size_t)1 != fwrite(&version, sizeof(int), 1, f)) write_ok = false;
+  if ((size_t)1 != fwrite(&nelem, sizeof(int), 1, f)) write_ok = false;
+  if ((size_t)1 != fwrite(&ncv, sizeof(int), 1, f)) write_ok = false;
+  if ((size_t)1 != fwrite(&nmodes_, sizeof(int), 1, f)) write_ok = false;
+  if ((size_t)1 != fwrite(&ido, sizeof(int), 1, f)) write_ok = false;
+  if ((size_t)11 != fwrite(iparam, sizeof(int), 11, f)) write_ok = false;
+  if ((size_t)11 != fwrite(ipntr, sizeof(int), 11, f)) write_ok = false;
+  if ((size_t)nelem != fwrite(resid, sizeof(double), nelem, f)) write_ok = false;
+  if ((size_t)(ncv * nelem) != fwrite(eigenvectors, sizeof(double), ncv * nelem, f)) write_ok = false;
+  if ((size_t)(3 * nelem) != fwrite(workd, sizeof(double), 3 * nelem, f)) write_ok = false;
+  if ((size_t)lworkl != fwrite(workl, sizeof(double), lworkl, f)) write_ok = false;
+  if ((size_t)nelem != fwrite(evalues_, sizeof(double), nelem, f)) write_ok = false;
+  fclose(f);
+  
+  if (write_ok)
+    mprintf("\tCheckpoint written to '%s' (%d converged, %d mv)\n", chkfn.Full().c_str(), nconv, mvprod);
+  else
+    mprintf("\tWarning: incomplete checkpoint write to '%s'\n", chkfn.Full().c_str());
+}
+
+// DataSet_Modes::CheckpointDelete()
+// Delete checkpoint file after successful convergence.
+// Note: File deletion only on master rank in MPI; OpenMP-safe (serial I/O).
+void DataSet_Modes::CheckpointDelete()
+{
+  if (!checkpointEnabled_) return;
+
+#ifdef MPI
+  // Only master rank deletes checkpoint file
+  if (!Parallel::World().Master()) return;
+#endif
+  
+  FileName const& chkfn = checkpointFile_;
+  if (chkfn.empty() || !File::Exists(chkfn)) return;
+  
+  if (remove(chkfn.Full().c_str()) == 0)
+    mprintf("\tCheckpoint '%s' deleted after convergence.\n", chkfn.Full().c_str());
+  else
+    mprintf("\tWarning: failed to delete checkpoint '%s'\n", chkfn.Full().c_str());
 }
 
 /// Class used to sort eigenvalue/index pairs

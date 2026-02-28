@@ -83,6 +83,21 @@ class DataSet_Modes : public DataSet {
     /// Class used to sort eigenvalue/index pairs
     class EvIdxPair;
 
+    // Checkpoint helper functions for Arnoldi iteration
+    /// Load checkpoint data from file during Arnoldi iteration
+    /// \return Number of converged modes on success, 0 or negative on failure
+    /// Sets ido to the saved reverse-communication flag
+    int CheckpointLoad(int nelem, int ncv, int lworkl,
+                       int& ido, int* iparam, int* ipntr, double* resid, double* eigenvectors,
+                       double* workd, double* workl, double* evalues_);
+    /// Save checkpoint data to file during Arnoldi iteration
+    void CheckpointSave(int nelem, int ncv, int lworkl, int ido,
+                        const int* iparam, const int* ipntr, const double* resid,
+                        const double* eigenvectors, const double* workd,
+                        const double* workl, const double* evalues_);
+    /// Delete checkpoint file after successful convergence
+    void CheckpointDelete();
+
     int ReduceCovar();
     int ReduceDistCovar();
 
