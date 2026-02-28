@@ -2,6 +2,8 @@
 #define INC_DATASET_MATRIXFLT_H
 #include "DataSet_2D.h"
 #include "Matrix.h"
+#include "FileName.h"
+
 /// Single-precision two-dimensional matrix.
 class DataSet_MatrixFlt : public DataSet_2D {
   public:
@@ -43,8 +45,20 @@ class DataSet_MatrixFlt : public DataSet_2D {
     typedef Matrix<float>::iterator iterator;
     iterator begin()                           { return mat_.begin();       }
     iterator end()                             { return mat_.end();         }
+    // Checkpointing support for long calculations:
+    void SetCheckpointFile(FileName const& fname) 
+            { checkpointFile_ = fname; checkpointEnabled_ = true; }
+    void SetCheckpointFile(std::string const& fname) 
+            { checkpointFile_.SetFileName(fname); checkpointEnabled_ = true; } 
+    void DisableCheckpoint() 
+            { checkpointEnabled_ = false; }
+    FileName const& GetCheckpointFile() const 
+            { return checkpointFile_; }
+    bool CheckpointEnabled() const { return checkpointEnabled_; }
   private:
     Matrix<float> mat_;
     MatrixKindType kind_;
+    FileName checkpointFile_;
+    bool     checkpointEnabled_;
 };
 #endif

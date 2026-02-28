@@ -10,6 +10,7 @@ Analysis_Matrix::Analysis_Matrix() :
   thermo_temp_(298.15),
   nevec_(0),
   thermopt_(false),
+  checkptopt_(false),
   reduce_(false),
   nmwizopt_(false),
   nmwizvecs_(0),
@@ -18,7 +19,7 @@ Analysis_Matrix::Analysis_Matrix() :
 
 void Analysis_Matrix::Help() const {
   mprintf("\t<matrix name> [out <filename>] [thermo [outthermo <filename>] [temp <T>]]\n"
-          "\t[vecs <#>] [name <modesname>] [reduce]\n"
+          "\t[vecs <#>] [ checkpoint ] [name <modesname>] [reduce]\n"
           "\t[ nmwiz [nmwizvecs <n>] [nmwizfile <file>] %s\n"
           "\t  nmwizmask <mask> ]\n"
           "  Diagonalize given symmetric matrix to obtain eigenvectors\n"
@@ -79,6 +80,7 @@ Analysis::RetType Analysis_Matrix::Setup(ArgList& analyzeArgs, AnalysisSetup& se
   
   // Filenames
   DataFile* outfile = setup.DFL().AddDataFile( analyzeArgs.GetStringKey("out"), analyzeArgs);
+  
   // Thermo flag
   thermopt_ = analyzeArgs.hasKey("thermo");
   if (thermopt_) {
@@ -91,6 +93,18 @@ Analysis::RetType Analysis_Matrix::Setup(ArgList& analyzeArgs, AnalysisSetup& se
     mprinterr("Error: Parameter 'thermo' only works for mass-weighted covariance matrix ('mwcovar').\n");
     return Analysis::ERR;
   }
+
+  // Checkpointed diagonalisation flag
+  checkptopt_      = analyzeArgs.hasKey("checkpoint"); 
+  if ( checkptopt_ ) {
+    if (outfile == 0){
+      mprinterr("Error: Parameter 'checkpoint' only works if a final eigenvector output filename is provided.\n");
+      return Analysis::ERR;
+    }
+    mprintf("Checkpointing of diagonalisation selected: iterative matrix diagonalisation will therefore be used.\n");
+    mprintf(" ..partial outputs to use as a restart (r/w file) will be stored in %s.chk\n", outfile->DataFilename().full());
+  }  
+
   // Number of eigenvectors; allow "0" only in case of 'thermo'. -1 means 'All'
   nevec_ = analyzeArgs.getKeyInt("vecs",-1);
   if (nevec_ == 0 && !thermopt_) {
@@ -106,6 +120,13 @@ Analysis::RetType Analysis_Matrix::Setup(ArgList& analyzeArgs, AnalysisSetup& se
   modes_ = (DataSet_Modes*)setup.DSL().AddSet( DataSet::MODES, md, "Modes" );
   if (modes_==0) return Analysis::ERR;
   if (outfile != 0) outfile->AddDataSet( modes_ );
+  
+  // Set checkpoint file if checkpointing is enabled
+  if (checkptopt_) {
+    FileName checkpointFilename = outfile->DataFilename();
+    checkpointFilename.Append(".chk");
+    modes_->SetCheckpointFile( checkpointFilename );
+  }
 
   // Print Status
   mprintf("    DIAGMATRIX: Diagonalizing matrix %s",matrix_->legend());

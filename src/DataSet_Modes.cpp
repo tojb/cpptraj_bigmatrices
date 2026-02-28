@@ -39,7 +39,9 @@ DataSet_Modes::DataSet_Modes() :
   vecsize_(0),
   reduced_(false),
   evecsAreMassWtd_(false),
-  evalsAreFreq_(false)
+  evalsAreFreq_(false),
+  checkpointFile_(),
+  checkpointEnabled_(false)
 {}
 
 // DESTRUCTOR
@@ -54,7 +56,7 @@ size_t DataSet_Modes::MemUsageInBytes() const {
                   (mass_.size() * sizeof(double)) +
                   (2 * sizeof(double*)) +
                   (2 * sizeof(int)) +
-                  (3 * sizeof(bool));
+                  (4 * sizeof(bool));
   if (evalues_ != 0)
     mySize += ((size_t)nmodes_ * sizeof(double));
   if (evectors_ != 0)
@@ -217,7 +219,23 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
     nmodes_ = ncols;
     mprintf("Warning: Only calculating %i eigenmodes.\n", nmodes_);
   }
-  bool calcAll = (nmodes_ == ncols);
+  bool calcAll        = (nmodes_ == ncols);
+  
+  // If checkpointing is enabled, force use of iterative Arnoldi method
+  // since the direct diagonalization (dspev) cannot be checkpointed
+  if (checkpointEnabled_) {
+    if (calcAll) {
+      mprintf("\tCheckpointing enabled: will use iterative Arnoldi method for all %i modes.\n", ncols);
+      calcAll = false; // Force iterative method
+    } else {
+      mprintf("\tCheckpointing enabled: using iterative Arnoldi method to calculate %i of %i modes.\n", nmodes_, ncols);
+    }
+#   ifdef NO_ARPACK
+    mprinterr("Error: Checkpointing requires ARPACK support (compiled without it).\n");
+    return 1;
+#   endif
+  }
+  
 # ifdef NO_ARPACK
   if (!calcAll) {
     mprintf("Warning: Compiled without ARPACK. All %i modes must be calculated, may be slow.\n",

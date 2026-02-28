@@ -15,16 +15,17 @@ class Analysis_Matrix : public Analysis {
   private:
     int NMWizOutput() const;
 
-    DataSet_2D* matrix_;
+    DataSet_2D*    matrix_;
     DataSet_Modes* modes_;
     CpptrajFile* outthermo_;
     double thermo_temp_;
-    int nevec_;
-    bool thermopt_;
-    bool reduce_;
-    bool nmwizopt_;
-    int nmwizvecs_;
+    int    nevec_;
+    bool   thermopt_;
+    bool   checkptopt_;
+    bool   reduce_;
+    bool   nmwizopt_;
+    int    nmwizvecs_;
     CpptrajFile* nmwizfile_;
-    Topology nmwizParm_;
+    Topology     nmwizParm_;
 };
 #endif

@@ -1,6 +1,7 @@
 #ifndef INC_DATASET_MODES_H
 #define INC_DATASET_MODES_H
 #include "DataSet.h"
+#include "FileName.h"
 class DataSet_2D;
 /// Hold eigenvalues/eigenvectors and optionally averaged coords.
 class DataSet_Modes : public DataSet {
@@ -70,6 +71,14 @@ class DataSet_Modes : public DataSet {
     bool IsReduced()                 const { return reduced_;                   }
     bool EvecsAreMassWtd()           const { return evecsAreMassWtd_;           }
     bool EvalsAreFreq()              const { return evalsAreFreq_;              }
+    /// Enable checkpointing to file during diagonalization (forces iterative method)
+    void SetCheckpointFile(FileName const& fname) { checkpointFile_ = fname; checkpointEnabled_ = true; }
+    /// Disable checkpointing during diagonalization
+    void DisableCheckpoint()                       { checkpointEnabled_ = false; }
+    /// Get checkpoint file path
+    FileName const& GetCheckpointFile()     const { return checkpointFile_; }
+    /// Check if checkpointing is enabled
+    bool IsCheckpointEnabled()              const { return checkpointEnabled_; }
   private:
     /// Class used to sort eigenvalue/index pairs
     class EvIdxPair;
@@ -86,5 +95,7 @@ class DataSet_Modes : public DataSet {
     bool reduced_;         ///< True if modes have been reduced
     bool evecsAreMassWtd_; ///< True if eigenvectors have been mass-weighted
     bool evalsAreFreq_;    ///< True if eigenvalues are in units of cm^-1
+    FileName checkpointFile_; ///< File for checkpointing during diagonalization
+    bool checkpointEnabled_;  ///< True if checkpointing progress of diagonalisation is enabled
 };
 #endif
