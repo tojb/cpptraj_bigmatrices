@@ -174,6 +174,7 @@
 #include "Analysis_Timecorr.h"
 #include "Analysis_IRED.h"
 #include "Analysis_Modes.h"
+#include "Analysis_EntropyHD.h"
 #include "Analysis_CrankShaft.h"
 #include "Analysis_Statistics.h"
 #include "Analysis_CrossCorr.h"
@@ -430,6 +431,7 @@ void Command::Init() {
   Command::AddCmd( new Analysis_CurveFit(),    Cmd::ANA, 1, "curvefit" );
   Command::AddCmd( new Analysis_Matrix(),      Cmd::ANA, 2, "diagmatrix", "matrix" );
   Command::AddCmd( new Analysis_Divergence(),  Cmd::ANA, 1, "divergence" );
+  Command::AddCmd( new Analysis_EntropyHD(),   Cmd::ANA, 3, "entropy_hd", "entropy_harrisdryden", "entropy_schlitter" );
   Command::AddCmd( new Analysis_EvalPlateau(), Cmd::ANA, 1, "evalplateau" );
   Command::AddCmd( new Analysis_FFT(),         Cmd::ANA, 1, "fft" );
   Command::AddCmd( new Analysis_HausdorffDistance,Cmd::ANA,1,"hausdorff" );
@@ -507,23 +509,25 @@ void Command::AddCmd(DispatchObject* oIn, Cmd::DestType dIn, int nKeys, ...) {
     keys.push_back( std::string(key) );
   }
   va_end(args);
+
   commands_.Add( Cmd(oIn, keys, dIn) );
   // Store memory addresses of command keys for ReadLine
   for (Cmd::key_iterator key = commands_.Back().keysBegin();
-                         key != commands_.Back().keysEnd(); ++key)
-    names_.push_back( key->c_str() );
+                         key != commands_.Back().keysEnd(); ++key){
+       names_.push_back( key->c_str() );
+  }
 }
 
 /** Search Commands list for command with given keyword and object type. */
 Cmd const& Command::SearchTokenType(DispatchObject::Otype catIn, const char* keyIn,
                                     bool silent)
 {
+   
   for (CmdList::const_iterator cmd = commands_.begin(); cmd != commands_.end(); ++cmd)
   {
     if (catIn != cmd->Obj().Type()) continue;
     if (cmd->KeyMatches(keyIn)) return *cmd;
   }
-  if (!silent) mprinterr("'%s': Command not found.\n", keyIn);
   return EMPTY_;
 }
 

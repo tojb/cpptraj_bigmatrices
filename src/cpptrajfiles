@@ -114,6 +114,7 @@ COMMON_SOURCES= \
         Analysis_Divergence.cpp \
         Analysis_EvalPlateau.cpp \
         Analysis_FFT.cpp \
+        Analysis_EntropyHD.cpp \
         Analysis_HausdorffDistance.cpp \
         Analysis_Hist.cpp \
         Analysis_Integrate.cpp \
