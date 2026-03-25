@@ -38,19 +38,26 @@ private:
   DataSet_MatrixDbl*  outputDS_;
   AtomMask            mask_;
   int                 nSelected_;
-  int                 P_;
+  size_t              P_;
 
   static void   ComputeMean(double* mean, const double* X, int n, int p);
-  static void   ComputeCov (double* C, const double* X, const double* mean, int n, int p);
-  static double LogDetChol_FullCov ( double* M, int p );
-  static double LogDetChol (double* M, int p);
-  static double LogDetJac (double* M, int p, const double c_local);
-  double        SchlitterEntropy(const double* X, int n, int p, double c_local, double *masses) const;
-  double        _SchlitterEntropy(const double* X, int n, int p, double c_local) const;
+  void          ComputeCov (double* C, const double* X, const double* mean, int n );
+  double        LogDetChol_FullCov_Broken ( double* M ) const;
+  double        LogDetChol_FullCov ( double* M ) const;
+  double        LogDetChol_GramOrFullCov ( double* M, const double *X, double *masses, size_t n ) const;
+  double        LogDetChol ( double* M );
+  double        LogDetJac (double* M, size_t n ) const;
+  double        SchlitterEntropy(const double* X, int n, double *masses) const;
+  double        Stable_Schlitter_LogDet(const double* Xc, const size_t n, const size_t p, const double *masses) const;
+
   static void   LMFitBiasModel(const double* nvals, const double* Svals, int K,
                                      double& S0, double& m, double& a, double& SE);
 
-  static inline double* dalloc(size_t n) { return (double*) std::malloc(n * sizeof(double)); }
+  static inline double* dalloc(size_t n) { 
+	  double* p = (double*) std::malloc(n * sizeof(double));
+	  if(!p) mprinterr("memory fail in AnalysisEntropy!!\n");
+	  return p; 
+  }
 };
 
 #endif

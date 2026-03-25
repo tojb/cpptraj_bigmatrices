@@ -20,27 +20,46 @@
 //
 // This file is part of the AMBER software package, and is subject to the license terms
 //
-// Using pczdump’s Schlitter as the physical reference (i.e., a sum of log⁡(1+α λi)\log(1+\alpha\,\lambda_i)log(1+αλi​) over covariance eigenvalues) 
-// we here compute the same quantity without any eigensolve by switching to a frame‑space Gram formulation and a small Cholesky log‑det. 
+// Using pczdump’s Schlitter as the physical reference 
+// (i.e., a sum of log⁡(1+α λi)\log(1+\alpha\,\lambda_i)log(1+αλi​) over covariance eigenvalues) 
+// we here compute the same quantity without any eigensolve by switching to a frame‑space
+// Gram formulation and a small Cholesky log‑det. 
 // This is mathematically justified by Sylvester’s determinant identity: 
-//  det⁡ ⁣(IP+α XcTXc)  =  det⁡ ⁣(IN+α XcXcT)\det\!\big(I_P + \alpha\,X_c^{\mathsf T}X_c\big) \;=\;
-//                      \det\!\big(I_N + \alpha\,X_cX_c^{\mathsf T}\big)det(IP​+αXcT​Xc​)=det(IN​+αXc​XcT​)
+//  det⁡ ⁣(IP+α XcTXc)  =  det⁡ ⁣(IN+α XcXcT)\det\!\big(IP_ + \alpha\,X_c^{\mathsf T}X_c\big) \;=\;
+//                \det\!\big(I_N + \alpha\,X_cX_c^{\mathsf T}\big)det(IP​+αXcT​Xc​)
+//                =det(IN​+αXc​XcT​)
 // so we can work in N×NN\times NN×N (frames) rather than P×PP\times PP×P (coordinates). 
 // This delivers an eigensolve‑free Schlitter that is directly comparable to pczdump’s 
-// ∑ilog⁡(1+α λi)\sum_i \log(1+\alpha\,\lambda_i)∑i​log(1+αλi​) because both are exactly log⁡det⁡(I+α C)\log\det(I+\alpha\,C)logdet(I+αC).
+// ∑ilog⁡(1+α λi)\sum_i \log(1+\alpha\,\lambda_i)∑i​log(1+αλi​) 
+// because both are exactly log⁡det⁡(I+α C)\log\det(I+\alpha\,C)logdet(I+αC).
 //
-// This is NOT directly comparable to the output of "diagmatrix thermo" because that uses a different formula for the entropy per degree
-// of freedom, based on the Quantum Harmonic Oscillator, which is unfortunately not easily expressed in a Gram formulation and thus does require an eigensolve.
+// This is NOT directly comparable to the output of "diagmatrix thermo" because 
+// that uses a different formula for the entropy per degree
+// of freedom, based on the Quantum Harmonic Oscillator, which is unfortunately not easily
+// expressed in a Gram formulation and thus does require an eigensolve.
 //
-// Deltas of entropy between different states or conditions should be comparable across both methods, however, since the different fudge factors 
-// employed to avoid taking log of zero or negative eigenvalues should largely cancel out. The "fudge factor" in the QHO formula is a constant
-// added to the eigenvalues, with some physical justification, 
+// Deltas of entropy between different states or conditions should be
+// comparable across both methods, however, since the different fudge factors 
+// employed to avoid taking log of zero or negative eigenvalues should largely cancel out. 
+//
+// The "fudge factor" in the QHO formula is a constant added to the eigenvalues,
+// with some physical justification, 
 // while the "fudge factor" in the Schlitter formula is a constant multiplied by the covariance matrix, 
 // with an unclear physical justification if any, so they are not directly comparable, 
 // but both serve to regularize the entropy estimate.
 //
-// The advanced feature here is the Harris–Dryden bias correction, which fits the observed S(n) to the empirical scaling form S(n) = S0 + m * n^{-a} 
+// The advanced feature here is the Harris–Dryden bias correction, 
+// which fits the observed S(n) to the empirical scaling form S(n) = S0 + m * n^{-a} 
 // and extrapolates as n→∞ to get S0, which is a less biased estimate of the true configurational entropy.
+//
+// In production versions the classical Harris-Dryden is found not to actually work very well,
+// especially for large systems where the number of frames needed to get a stable entropy estimate
+// is actually quite a lot less than the number of frames needed to fully overdetermine the matrix,
+// so cpptraj's Analysis_Regression framework has been extended to offer Harris-Dryden power law format
+// as well as exponential saturation functions f(x)=A(1-exp(-Bx)) which seems to work better for larger
+// systems / relatively shorter times.
+//
+// Caveat Emptor, Caveant Omnes
 //
 // 05/03/2026 Joshua T Berryman, josh.berryman@uni.lu.
 //
@@ -50,6 +69,11 @@
 
 #include <omp.h>
 #include <cstring>              // std::memcpy()
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <cstdlib>
+
 #include "CpptrajStdio.h"      // mprintf(), mprinterr()
 #include "DataSet.h"
 #include "DataSet_MatrixDbl.h"
@@ -171,38 +195,6 @@ void Analysis_EntropyHD::ComputeMean(double* mean, const double* X, int n, int p
   }
 }
 
-// ---------------------------- low-level math ---------------------------------
-void Analysis_EntropyHD::ComputeCov(double* C,
-                                    const double* X,
-                                    const double* mean,
-                                    int n, int p)
-{
-  // Zero the covariance matrix
-#ifdef _OPENMP
-#pragma omp parallel for collapse(2)
-#endif
-  for (int i = 0; i < p; ++i)
-    for (int j = 0; j < p; ++j)
-      C[i * p + j] = 0.0;
-
-  // Accumulate upper triangle (then mirror)
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-  for (int i = 0; i < p; ++i) {
-    for (int j = i; j < p; ++j) {
-      double s = 0.0;
-      for (int k = 0; k < n; ++k) {
-        const double xi = X[k * p + i] - mean[i];
-        const double xj = X[k * p + j] - mean[j];
-        s += xi * xj;
-      }
-      s /= static_cast<double>(n);
-      C[i * p + j] = s;
-      C[j * p + i] = s;
-    }
-  }
-}
 
 
 // ============================================================================
@@ -219,22 +211,22 @@ void Analysis_EntropyHD::ComputeCov(double* C,
 //
 // NOTE: This is for debugging only; Jacobi is O(n^3) with a large constant.
 // ============================================================================
-double Analysis_EntropyHD::LogDetJac(double* M, int n, const double c_local)
+double Analysis_EntropyHD::LogDetJac(double* M, size_t max_evs ) const
 {
     // ---- Make a private copy so the caller’s matrix is preserved ----
-    std::vector<double> A((size_t)n * n);
-    std::memcpy(A.data(), M, (size_t)n * n * sizeof(double));
+    std::vector<double> A((size_t)P_ * P_);
+    std::memcpy(A.data(), M, (size_t)P_ * P_ * sizeof(double));
 
     // ---- Jacobi parameters ----
-    const int maxIter = 100 * n;         // generous upper bound
+    const int maxIter = 100 * P_;         // generous upper bound
     const double eps  = 1e-14;
 
     // Diagonal (eigenvalues), work arrays
-    std::vector<double> d(n), b(n), z(n);
+    std::vector<double> d(P_), b(P_), z(P_);
 
     // Initialize eigenvalue guesses from the diagonal
-    for (int i = 0; i < n; ++i) {
-        d[i] = A[(size_t)i * n + i];
+    for (size_t i = 0; i < P_; ++i) {
+        d[i] = A[(size_t)i * P_ + i];
         b[i] = d[i];
         z[i] = 0.0;
     }
@@ -243,24 +235,24 @@ double Analysis_EntropyHD::LogDetJac(double* M, int n, const double c_local)
     for (int iter = 0; iter < maxIter; ++iter) {
         // Sum of absolute off-diagonal elements
         double sm = 0.0;
-        for (int p = 0; p < n-1; ++p)
-            for (int q = p+1; q < n; ++q)
-                sm += std::fabs(A[(size_t)p * n + q]);
+        for (size_t p = 0; p < P_-1; ++p)
+            for (size_t q = p+1; q < P_; ++q)
+                sm += std::fabs(A[(size_t)p * P_ + q]);
 
         // Converged?
         if (sm < eps) break;
 
-        const double tresh = (iter < 3 ? 0.2 * sm / (n * n) : 0.0);
+        const double tresh = (iter < 3 ? 0.2 * sm / (P_ * P_) : 0.0);
 
-        for (int p = 0; p < n-1; ++p) {
-            for (int q = p+1; q < n; ++q) {
-                const double apq = A[(size_t)p * n + q];
+        for (size_t p = 0; p < P_-1; ++p) {
+            for (size_t q = p+1; q < P_; ++q) {
+                const double apq = A[(size_t)p * P_ + q];
                 const double g = 100.0 * std::fabs(apq);
 
                 if (iter > 3 &&
                     (std::fabs(d[p]) + g) == std::fabs(d[p]) &&
                     (std::fabs(d[q]) + g) == std::fabs(d[q])) {
-                    A[(size_t)p * n + q] = 0.0;
+                    A[(size_t)p * P_ + q] = 0.0;
                 } else if (std::fabs(apq) > tresh) {
                     const double h = d[q] - d[p];
                     double t;
@@ -280,33 +272,33 @@ double Analysis_EntropyHD::LogDetJac(double* M, int n, const double c_local)
                     z[q] += h2;
                     d[p] -= h2;
                     d[q] += h2;
-                    A[(size_t)p * n + q] = 0.0;
+                    A[(size_t)p * P_ + q] = 0.0;
 
                     // Rotate rows/cols
-                    for (int j = 0; j < p; ++j) {
-                        const double Apj = A[(size_t)j * n + p];
-                        const double Ajq = A[(size_t)j * n + q];
-                        A[(size_t)j * n + p] = Apj - s * (Ajq + Apj * tau);
-                        A[(size_t)j * n + q] = Ajq + s * (Apj - Ajq * tau);
+                    for (size_t j = 0; j < p; ++j) {
+                        const double Apj = A[(size_t)j * P_ + p];
+                        const double Ajq = A[(size_t)j * P_ + q];
+                        A[(size_t)j * P_ + p] = Apj - s * (Ajq + Apj * tau);
+                        A[(size_t)j * P_ + q] = Ajq + s * (Apj - Ajq * tau);
                     }
-                    for (int j = p+1; j < q; ++j) {
-                        const double Apj = A[(size_t)p * n + j];
-                        const double Ajq = A[(size_t)j * n + q];
-                        A[(size_t)p * n + j] = Apj - s * (Ajq + Apj * tau);
-                        A[(size_t)j * n + q] = Ajq + s * (Apj - Ajq * tau);
+                    for (size_t j = p+1; j < q; ++j) {
+                        const double Apj = A[(size_t)p * P_ + j];
+                        const double Ajq = A[(size_t)j * P_ + q];
+                        A[(size_t)p * P_ + j] = Apj - s * (Ajq + Apj * tau);
+                        A[(size_t)j * P_ + q] = Ajq + s * (Apj - Ajq * tau);
                     }
-                    for (int j = q+1; j < n; ++j) {
-                        const double Apj = A[(size_t)p * n + j];
-                        const double Aqj = A[(size_t)q * n + j];
-                        A[(size_t)p * n + j] = Apj - s * (Aqj + Apj * tau);
-                        A[(size_t)q * n + j] = Aqj + s * (Apj - Aqj * tau);
+                    for (size_t j = q+1; j < P_; ++j) {
+                        const double Apj = A[(size_t)p * P_ + j];
+                        const double Aqj = A[(size_t)q * P_ + j];
+                        A[(size_t)p * P_ + j] = Apj - s * (Aqj + Apj * tau);
+                        A[(size_t)q * P_ + j] = Aqj + s * (Apj - Aqj * tau);
                     }
                 }
             }
         }
 
         // Update diagonal
-        for (int i = 0; i < n; ++i) {
+        for (size_t i = 0; i < P_; ++i) {
             b[i] += z[i];
             d[i]  = b[i];
             z[i]  = 0.0;
@@ -318,11 +310,11 @@ double Analysis_EntropyHD::LogDetJac(double* M, int n, const double c_local)
     std::sort(evals.begin(), evals.end(), std::greater<double>());
 
     // Print a preview
-    mprintf("DEBUG(Jacobi): top eigenvalues of M (n=%d):\n", n);
-    const int preview = std::min(n, 32);
+    mprintf("DEBUG(Jacobi): top eigenvalues of M (n=%d):\n", P_);
+    const int preview = std::min(int(P_), 32);
     for (int i = 0; i < preview; ++i)
         mprintf("  %3d : %.15e\n", i, evals[i]);
-    if (n > preview) mprintf("  ... (%d total eigenvalues)\n", n);
+    if (P_ > (size_t)preview) mprintf("  ... (%d total eigenvalues)\n", P_);
 
     // Compute logdet and guard non-positive eigenvalues
     double logdet = 0.0;
@@ -330,35 +322,32 @@ double Analysis_EntropyHD::LogDetJac(double* M, int n, const double c_local)
     double running_total = 0.0; // For debugging Schlitter contributions
     float  unitsFactor = ( (0.5*8.314)/(4.2*1000) ); /* convert to kcal/mol */
 
-    const double alpha = c_local / double(n - 1);
-    mprintf("DEBUG: alpha(c_local/(n-1)) = %.15e (n=%d)\n", alpha, n);
+    //const double alpha = c_local / double(n - 1);
+    ///
+    //mprintf("DEBUG: alpha(c_local/(n-1)) = %.15e (n=%d)\n", alpha, n);
 
 
     // Optional: write all eigenvalues to file if an env var is set
     FILE* F = std::fopen("evdump_debug.txt", "w");
 
-    for (int i = 0; i < n; ++i) {
+    for (size_t i = 0; i < P_; ++i) {
 
-
+      if( i >= max_evs && max_evs > 0 ){
+         mprintf("treating matrix as underdetermined, and summing only %lu evs\n", max_evs);
+         break;
+      }
 // Convert Jacobi eigenvalue µ_i of A = I + α C  →  covariance eigenvalue λ_i(C)
-const double lambda = (evals[i] - 1.0) / alpha;
 
 // pczdump’s per-mode Schlitter term:  300 * log(1 + 46.03 * λ_i) * unitsFactor
-const double perEv_pcz = 300.0 * std::log(1.0 + 46.03 * evals[i]) * unitsFactor;
+//const double perEv_pcz = temp_ * std::log(1.0 + 46.03 * (temp_ / 300.) * evals[i]) * unitsFactor;
 
-if ( evals[i] > 0.0 ) {
-    // Running total (accumulate like pczdump does)
-    running_total += std::log(1.0 + 46.03 * lambda);
-    //mprintf("DEBUG: λ_i = %.6e, perEv_pcz = %.6e, running_total = %.6e\n", lambda, perEv_pcz, 300.0 * running_total * unitsFactor);
-}
+//      std::fprintf(F, "%.17e\n", perEv_pcz);
 
-        std::fprintf(F, "%.17e\n", perEv_pcz);
-
-        if (evals[i] <= 0.0) {
-            nonpos++;
-        } else {
-            logdet += std::log(1.0 + 46.03 * evals[i]); // log(1 + α λ_i) with α=46.03 for pczdump compatibility
-        }
+      if (evals[i] <= 0.0) {
+        nonpos++;
+      } else {
+        logdet += std::log(1.0 + 46.03 * (temp_/300.) * evals[i]); // log(1 + α λ_i) with α=46.03@300K 
+      }
     }
     std::fclose(F);
     if (nonpos > 0)
@@ -368,278 +357,123 @@ if ( evals[i] > 0.0 ) {
     return logdet;
 }
 
-double Analysis_EntropyHD::LogDetChol(double* M, int p)
-{
-  double logd = 0.0;
-
-  for (int j = 0; j < p; ++j) {
-    // Diagonal element update: M[j,j] -= sum_k L[j,k]^2
-    double sum = M[j * p + j];
-    for (int k = 0; k < j; ++k) {
-      const double Ljk = M[j * p + k];
-      sum -= Ljk * Ljk;
-    }
-
-    if (sum <= 0.0)
-      return -1e300; // Matrix not positive definite
-
-    const double Ljj = std::sqrt(sum);
-    M[j * p + j] = Ljj;
-    logd += std::log(Ljj);
-
-    // Off-diagonal: solve for column j below the diagonal
-    const double invLjj = 1.0 / Ljj;
-    for (int i = j + 1; i < p; ++i) {
-      double s = M[i * p + j];
-      for (int k = 0; k < j; ++k)
-        s -= M[i * p + k] * M[j * p + k];
-      M[i * p + j] = s * invLjj;
-    }
-  }
-
-  // log|M| = 2 * sum log(diag(L))
-  return 2.0 * logd;
-}
-
-
-
-// If you want to use LAPACK dpotrf when available, define USE_LAPACK_DPOTRF
-// and link with your LAPACK/BLAS. Otherwise the hand-rolled Cholesky is used.
-// #define USE_LAPACK_DPOTRF
-
-#ifdef USE_LAPACK_DPOTRF
-extern "C" {
-  // dpotrf: Cholesky factorization of a real symmetric positive definite matrix.
-  void dpotrf_(char* uplo, int* n, double* a, int* lda, int* info);
-}
-#endif
 
 // -----------------------------------------------------------------------------
-// Cholesky logdet on FULL covariance (no Gram):
-// - M is (p x p) in row-major, symmetric; this routine will overwrite M with
-//   the Cholesky factor (lower triangle) and junk in the upper.
-// - Returns: log(det(M)) = 2 * sum(log(L_ii)).
-// - If M is not SPD due to tiny negative round-off on diag or near-singularity,
-//   a small diagonal ridge is added and the factorization is retried.
-//
-// -----------------------------------------------------------------------------
-double Analysis_EntropyHD::LogDetChol_FullCov(double *M, int p)
-{
-
-    bool   scaleDiag  = true; // Whether to apply optional diagonal scaling for better conditioning.
-    double ridge0     = 0.0;    // Initial ridge to add on failure (0 means auto-heuristic based on trace/p).
-    int    maxRidgeIt = 5;     // Maximum number of ridge doubling attempts before giving up.
-
-    double alpha = 46.03; // Schlitter fudge factor: hard-code for match to pczdump’s 300 * log(1 + 46.03 * λ_i) formula, where 46.03 = (2πe kB T / hbar^2) * (AMBER distance unit)^2
-                       // Note that the fudge factor is applied as M = I + alpha * C, so alpha is the multiplier on the covariance matrix.
-                       // The value of 46.03 corresponds to c_local = 46.03 in the Schlitter formula, which is what pczdump uses at T=300K with AMBER units.
-                       // If you want to make this user-configurable, you could add a parameter for c_local and compute alpha = c_local / (n - 1) here.
-
-    // M <- I + alpha*covariance
-    for (int i = 0; i < p; ++i) {
-        double* Ci = M + (size_t)i * p;
-        for (int j = 0; j < p; ++j) 
-             Ci[j] *= alpha;
-        Ci[i] += 1.0; // add identity
-    }
-
-
-    // (1) Optional diagonal scaling: M = D^{-1/2} * M * D^{-1/2},
-    //     where D is diag of M. Improves conditioning; we adjust logdet later.
-    double scaleShift = 0.0; // add p * (-log s) to logdet if we scale by s per-row/col
-    std::vector<double> dscale;
-    if (scaleDiag) {
-        dscale.resize(p, 1.0);
-        // Build D^{-1/2} from the diagonal; handle zero/small diag defensively
-        for (int i = 0; i < p; ++i) {
-            const double di = M[(size_t)i * p + i];
-            // If zero/negative from noise, clamp to tiny positive to proceed
-            const double di_pos = (di > 0.0 ? di : 1e-300);
-            dscale[i] = 1.0 / std::sqrt(di_pos);
-        }
-        // M <- D^{-1/2} * M * D^{-1/2}
-        for (int i = 0; i < p; ++i) {
-            double* Mi = M + (size_t)i * p;
-            const double si = dscale[i];
-            for (int j = 0; j < p; ++j) {
-                Mi[j] *= si * dscale[j];
-            }
-        }
-        // Adjust to later undo: det(M_old) = det(D^{1/2} M_new D^{1/2})
-        // => log det(M_old) = log det(M_new) + sum_i log(di)  (since D = diag(di))
-        // But we used di_pos; track correction using original diag or di_pos
-        double sumLogD = 0.0;
-        for (int i = 0; i < p; ++i) {
-            const double di = 1.0 / (dscale[i] * dscale[i]); // = di_pos
-            sumLogD += std::log(di);
-        }
-        // det scaling across both sides contributes +sumLogD
-        scaleShift = sumLogD;
-    }
-
-    // (3) Prepare ridge heuristic if not provided
-    double ridge = ridge0;
-    if (ridge <= 0.0) {
-        // Start ridge as tiny fraction of trace/p
-        double tr = 0.0;
-        for (int i = 0; i < p; ++i) tr += M[(size_t)i * p + i];
-        double avg = (tr > 0.0 ? tr / (double)p : 1.0);
-        ridge = std::max(1e-12, 1e-12 * avg);
-    }
-
-    // We will try factorization; on failure, add ridge to the diagonal and retry.
-    for (int attempt = 0; attempt <= maxRidgeIt; ++attempt) {
-
-        // ---- Hand-rolled lower-triangular Cholesky in-place ----
-        // Make a working copy so we can re-try with ridge without accumulating multiple times.
-        std::vector<double> A((size_t)p * p);
-        std::memcpy(A.data(), M, sizeof(double) * (size_t)p * p);
-        if (attempt > 0) {
-            for (int i = 0; i < p; ++i) A[(size_t)i*p + i] += ridge;
-        }
-
-        bool ok = true;
-        double logd = 0.0;
-
-        for (int j = 0; j < p && ok; ++j) {
-            // Update diagonal: A[j,j] -= sum_k A[j,k]^2
-            double sum = A[(size_t)j * p + j];
-            for (int k = 0; k < j; ++k) {
-                const double Ljk = A[(size_t)j * p + k];
-                sum -= Ljk * Ljk;
-            }
-            if (!(sum > 0.0)) { ok = false; break; }
-            const double Ljj = std::sqrt(sum);
-            A[(size_t)j * p + j] = Ljj;
-            logd += std::log(Ljj);
-
-            // Compute below-diagonal column j: A[i,j] = (A[i,j] - sum_k A[i,k]*A[j,k]) / Ljj
-            const double invLjj = 1.0 / Ljj;
-            for (int i = j + 1; i < p; ++i) {
-                double s = A[(size_t)i * p + j];
-                for (int k = 0; k < j; ++k) {
-                    s -= A[(size_t)i * p + k] * A[(size_t)j * p + k];
-                }
-                A[(size_t)i * p + j] = s * invLjj;
-            }
-        }
-
-        if (ok) {
-            // Success: copy factor back to M if you wish
-            std::memcpy(M, A.data(), sizeof(double) * (size_t)p * p);
-            return 2.0 * logd + (scaleDiag ? scaleShift : 0.0);
-        }
-        // Not SPD enough: increase ridge and retry
-        ridge *= 10.0;
-    }
-    // If we are here, matrix could not be stabilized
-    return -1e300; // signal failure
-}
-
-
-
-
-
-
-
-
-
-
-
-
-// -----------------------------------------------------------------------------
-// Eigensolve-free Schlitter log-det using the frame-space Gram trick.
+// Eigensolve-free Schlitter log-det 
 //
 // Computes: ld = log det( I + c_local * C )
 // with C the (unbiased) covariance of X (n frames × p dims, row-major).
-//
 // By Sylvester: det(I_p + c C) == det(I_n + (c/(n-1)) Xc Xc^T),
 // where Xc is X centered along columns.
 //
 // Complexity: O(n^2 p) to build the Gram, then O(n^3) for Cholesky.
 // This is a win whenever n << p (typical MD).
 // -----------------------------------------------------------------------------
-double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, int p, double c_local, double *masses ) const
+double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, double *masses ) const
 {
-  // Basic guards
-  if (X == nullptr || n <= 1 || p <= 0 || c_local <= 0.0) return 0.0;
+  // Prevent crashes on crappy inputs 
+  if (X == nullptr || n <= 1 || P_ <= 0 ) return 0.0;
 
   // --- Step 1: column means (length p) ---
-  double* mean = dalloc(p);
+  double* mean = dalloc(P_);
   if (!mean) return 0.0;
 
   // mean[j] = average over frames of X[i*p + j]
-  for (int j = 0; j < p; ++j) mean[j] = 0.0;
-  for (int i = 0; i < n; ++i) {
-    const double* row = X + (size_t)i * p;
-    for (int j = 0; j < p; ++j) mean[j] += row[j];
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+  for (size_t j = 0; j < P_; ++j) mean[j] = 0.0;
+  for (size_t i = 0; i < (size_t)n; ++i) {
+    const double* row = X + i * P_;
+    for (size_t j = 0; j < P_; ++j) mean[j] += row[j];
   }
   const double invN = 1.0 / (double)n;
-  for (int j = 0; j < p; ++j) mean[j] *= invN;
+  for (size_t j = 0; j < P_; ++j) mean[j] *= invN;
 
   // --- Step 2: build A = I_n + alpha * Xc * Xc^T  (n x n SPD) ---
   // alpha = c_local / (n-1)   (same unbiased convention as ComputeCov)
-  const double alpha = c_local / (double)(n - 1);
 
   mprintf("Building covariance\n");
+  fflush(stdout);
   //try working with a normal covariance matrix
-  double* C = dalloc((size_t)p * p);
-  for (int i = 0; i < p; ++i) {
-    for (int j = 0; j < p; ++j) {
-      C[i * p + j] = 0.0;
+  double* C = dalloc((size_t)P_ * P_);
+  if ( !C ) {
+    mprinterr("Failed to allocate covariance matrix size %lu doubles\n", (size_t)P_ * P_);
+    return Analysis::ERR;
+  }
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2)
+#endif
+  for (size_t i = 0; i < P_; ++i) {
+    for (size_t j = 0; j < P_; ++j) {
+      C[i * P_ + j] = 0.0;
     } 
   }
-  for (int i = 0; i < n; ++i){ //loop over frames
-    const double* row = X + (size_t)i * p;
-    for (int j = 0; j < p; ++j) { //loop over DOF
+ 
+#ifdef _OPENMP
+#pragma omp parallel for 
+#endif
+  for (size_t i = 0; i < (size_t)n; ++i){ //loop over frames
+    const double* row = X + (size_t)i * P_;
+    for (size_t j = 0; j < P_; ++j) { //loop over DOF
       const double xij = row[j] - mean[j];
-      for (int k = 0; k < p; ++k) { //loop over DOF
+
+      for (size_t k = 0; k < P_; ++k) { //loop over DOF
         const double xik = row[k] - mean[k];
-        C[j * p + k] += xij * xik;
+        C[j * P_ + k] += xij * xik;
       }
     }
   }
-  for (int i = 0; i < p; ++i)
-    for (int j = i; j < p; ++j) {
-      double v = C[i*p + j] * invN * masses[i] * masses[j]; // covariance with mass weighting
-      C[i*p + j] = v;
-      C[j*p + i] = v;
+
+  double ld;
+
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+  for (size_t i = 0; i < P_; ++i)
+    for (size_t j = i; j < P_; ++j) {
+      double v = C[i*P_ + j] * masses[i] * masses[j] / (n - 1.); // covariance with mass weighting
+      C[i*P_ + j] = v;
+      C[j*P_ + i] = v;
     } 
 
-  #ifdef ENTROPYHD_DEBUG
-  FILE *F = std::fopen("cov_debug.txt", "w");
-  for (int i = 0; i < p; ++i) {
-     for (int j = 0; j < p; ++j) {
-      std::fprintf(F, "%.2f ", C[i*p + j]);
-     }
-      std::fprintf(F, "\n");
-  }
-  std::fclose(F);
-  #endif
-
-  // --- Step 3: log-det via Cholesky ---
+  // --- log-det via Cholesky ---
   // If numerical issues, add a tiny ridge to the diagonal and retry.
   //double ld = LogDetChol(A, n);
 
-  double* M = (double*)malloc(sizeof(double) * (size_t)P_ * P_);
 
-  
-  //mprintf("Getting log determinant of I + Cov by Jacobi\n");
-  //std::memcpy(M, C, sizeof(double) * (size_t)P_ * P_);
-  //double ldJ = LogDetJac(M, p, c_local);
-  
-  mprintf("Getting log determinant of I + Cov by Cholesky\n");
+  mprintf("Getting log determinant of I + Cov by Jacobi\n");
+  //this is horribly slow but was useful for debug
+  //
+  double *M = dalloc( P_ * P_ );
   std::memcpy(M, C, sizeof(double) * (size_t)P_ * P_);
-  double ld  = LogDetChol_FullCov(M, p);
+  double ldJ = 0.;
+  if (  n > P_ - 6 ){
+    //if we have more frames than degrees of freedom
+    //then the matrix should be fully determined less 6 rigid-body degrees of freedom.
+    ldJ = LogDetJac(M, P_ - 6);
+  } else {
+    //if the matrix is underdetermined, then don't consider junk nar-zero eigenvalues.
+    ldJ = LogDetJac(M, n);
+  }
+  free( M );
+  mprintf("                          via Jacobi = %.15e\n", ldJ);
+  fflush(stdout);
 
-  free(M);
-  mprintf("DEBUG: Schlitter logdet via Cholesky = %.15e\n", ld);
-  //mprintf("                          via Jacobi = %.15e\n", ldJ);
+  mprintf("Getting log determinant of I + Cov by Cholesky\n");
+  fflush(stdout);
+
+
+//  ld = LogDetChol_GramOrFullCov( C, X, masses, (size_t)n);
+//  ld  = LogDetChol_FullCov( C );
+
+  ld = ldJ;
+  std::free(C);
 
   // Cleanup
   std::free(mean);
 
-  // ld == sum_i log(1 + c_local * lambda_i) == Schlitter "core" quantity
   return ld;
 }
 
@@ -820,6 +654,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   }
   //get a mass vector for mass-weighting covariance later.
   P_ = 3 * nSelected_;
+  
   // ------------------------------------------------------------
   // Build per-coordinate mass vector (length p = 3*nSelected_)
   // ------------------------------------------------------------
@@ -849,7 +684,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
     mprinterr("entropy_hd: Failed to allocate memory for coordinate matrix.\n");
     return Analysis::ERR;
   }
-    BuildAlignedCoordinates(Coords_, mask_, X);
+  BuildAlignedCoordinates(Coords_, mask_, X);
   
 
   // ---------------------------------------
@@ -857,7 +692,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   // ---------------------------------------
   static constexpr double kB_kcal     = 0.00198720425864083;
   static constexpr double hbar_kcalps = 0.0635078;
-  const double c_local = (kB_kcal * temp_) / (hbar_kcalps * hbar_kcalps);
+//  const double c_local = (kB_kcal * temp_) / (hbar_kcalps * hbar_kcalps);
 
   // ---------------------------------------
   // 5. Compute number of windows
@@ -876,12 +711,22 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   // ---------------------------------------
   // 6. Compute S(n) for each prefix
   // ---------------------------------------
+  const double entropy_units = 0.5 * (8.314 / 4200.0);
+  const double min_TS        = 0.01; //minimum free energy contribution to consider an eigenmode.
   for (int i = 0; i < K; ++i) {
     int n = (i + 1) * window_;
 
     mprintf("doing schlitter for window %d with %d frames\n", i + 1, n);
 
-    Svals[i] = SchlitterEntropy( X, n, P_, c_local, massVec.data()) * (0.5* kB_kcal * temp_);  // free-energy units (kcal/mol);
+    double ld;
+    ld = Stable_Schlitter_LogDet( X, n, P_, massVec.data() );
+    mprintf("Got log determinant: %f\n", ld);
+
+    mprintf("Comparison for debug\n");
+    ld = SchlitterEntropy( X, n, massVec.data() );
+    mprintf("Jacobi log determinant: %f\n", ld);
+
+    Svals[i] = entropy_units * temp_ * ld; // free-energy units (kcal/mol);
     nvals[i] = (double)n;
 
     mprintf("window %d: n=%d frames, S(n)=%.4f kcal/mol @ T=%.1f K\n", i + 1, n, Svals[i], temp_);
@@ -892,7 +737,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   // 7. LM fit for each n_i and write K time points to DataSet
   // ---------------------------------------
   outputDS_->Allocate2D((size_t)K, 5);
-  for (int i = 0; i < K; ++i) {
+  for (int i = 3; i < K; ++i) {
     int Ki = i + 1;
 
     double S0 = 0.0, m = 0.0, a = 0.0, SE = 0.0;
@@ -917,8 +762,8 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   // ---------------------------------------
   if (!outfileName_.empty()) {
     FILE* F = fopen(outfileName_.c_str(), "w");
-    fprintf(F, "##Harris-Dryden entropy estimator: \n");
     if (F) {
+      fprintf(F, "##Harris-Dryden entropy estimator: \n");
       fprintf(F, "# n   S(n)   S0(n)   CIlo   CIhi\n");
       for (int i = 0; i < K; ++i)
         fprintf(F, "%d %.12f %.12f %.12f %.12f\n",
@@ -941,7 +786,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
       fprintf(F, "#     Sections 4.1–4.2, Schlitter entropy and bias behavior).  \n");
       fprintf(F, "#   - Harris et al. (2001) empirical bias scaling for S(nr S(n). \n");
       fprintf(F, "#Mask: %s\n", maskString_.empty() ? "<all atoms>" : maskString_.c_str());
-      fprintf(F, "#Selected atoms: %d (P=%d)\n", nSelected_, P_);
+      fprintf(F, "#Selected atoms: %i (P=%lu)\n", nSelected_, P_);
       fprintf(F, "#Temp=%.1f K  window=%d  frames=%d\n\n", temp_, window_, N);
       fprintf(F, "#n     S(n)        S0(n)       CIlo        CIhi\n");
       for (int i = 0; i < K; ++i)
@@ -1174,4 +1019,285 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
     mprintf("Aligned, rigid-body removed, and centered: %d frames × %d dims.\n",
             nFrames, p);
 }
+
+
+
+
+
+
+
+
+// --------------------------------------------------------------
+// Helper: lightweight matrix accessor (const + mutable)
+// --------------------------------------------------------------
+struct MatrixView {
+    double* data;
+    size_t n;
+    inline double& operator()(size_t r, size_t c) {
+        return data[r*n + c];
+    }
+    inline const double& operator()(size_t r, size_t c) const {
+        return data[r*n + c];
+    }
+};
+
+// Gershgorin + diag + symmetry diagnostics
+static void diag_report(const MatrixView& A, const char* tag) {
+    size_t n = A.n;
+    size_t nonpos_diag = 0;
+    double min_diag = +1e300, max_diag = -1e300;
+    double max_asym = 0.0, max_off = 0.0;
+    double gersh_min = +1e300;
+
+    for (size_t i = 0; i < n; ++i) {
+        double di = A(i,i);
+        if (!(di > 0.0)) nonpos_diag++;
+        min_diag = std::min(min_diag, di);
+        max_diag = std::max(max_diag, di);
+
+        double radius = 0.0;
+        for (size_t j = 0; j < n; ++j) {
+            double aij = A(i,j);
+            double aji = A(j,i);
+            max_asym = std::max(max_asym, std::fabs(aij - aji));
+            if (i != j) {
+                double off = std::fabs(aij);
+                max_off = std::max(max_off, off);
+                radius += off;
+            }
+        }
+        gersh_min = std::min(gersh_min, di - radius);
+    }
+
+    mprintf(">>> DIAG(%s): n=%zu  nonpos_diag=%zu  min_diag=% .6e  max_diag=% .6e\n",
+            tag, n, nonpos_diag, min_diag, max_diag);
+    mprintf("              max|A-A^T|=% .6e  max|off|=% .6e  Gershgorin_min=% .6e\n",
+            max_asym, max_off, gersh_min);
+}
+
+
+// --------------------------------------------------------------
+// Kahan‑compensated greedy pivoted Cholesky + log det
+// Works for both Gram and Cov matrices
+// --------------------------------------------------------------
+static double greedy_pivoted_cholesky_logdet(
+        MatrixView& A,
+        bool verbose = true,
+        double eps_pivot = 1e-12)
+{
+    const size_t n = A.n;
+
+    // Permutation vector
+    std::vector<size_t> piv(n);
+    for (size_t i = 0; i < n; ++i) piv[i] = i;
+
+    // Triangular compensation buffer
+    std::vector<double> comp(n*(n+1)/2, 0.0);
+    auto idxT = [&](size_t i, size_t j) -> size_t {
+        if (i < j) std::swap(i,j);
+        return (i*(i+1))/2 + j;
+    };
+
+    std::vector<double> row(n);
+    double logd = 0.0;
+
+    for (size_t k = 0; k < n; ++k) {
+
+        // ---- pivot search ----
+        double maxDiag = -1e300;
+        size_t p = k;
+        for (size_t i = k; i < n; ++i) {
+            double d = A(piv[i], piv[i]);
+            if (d > maxDiag) { maxDiag = d; p = i; }
+        }
+
+        if (maxDiag < eps_pivot) {
+            if (verbose) {
+                mprintf("PivotedChol: stop at k=%zu, maxDiag=% .6e\n", k, maxDiag);
+            }
+            return 2.0 * logd;
+        }
+
+        // ---- apply pivot ----
+        std::swap(piv[k], piv[p]);
+        const size_t pk = piv[k];
+
+        // ---- extract pivot ----
+        const double Akk = A(pk, pk);
+        if (!(Akk > 0.0)) {
+            if (verbose)
+                mprintf("PivotedChol: non-positive pivot at k=%zu: % .6e\n", k, Akk);
+            return 2.0 * logd;
+        }
+        const double Lkk = std::sqrt(Akk);
+        A(pk, pk) = Lkk;
+        logd += std::log(Lkk);
+
+        const double invLkk = 1.0 / Lkk;
+
+        // ---- build row ----
+        for (size_t j = k+1; j < n; ++j) {
+            size_t pj = piv[j];
+            row[j] = A(pk, pj) * invLkk;
+        }
+
+        // ---- Kahan‑compensated Schur update ----
+        for (size_t i = k+1; i < n; ++i) {
+            size_t pi = piv[i];
+            double ri = row[i];
+
+            for (size_t j = i; j < n; ++j) {
+                size_t pj = piv[j];
+                double rj = row[j];
+                double term = -(ri * rj);
+
+                double& aij = A(pi, pj);
+                double& cij = comp[idxT(pi,pj)];
+
+                double delta = term - cij;
+                double t = aij + delta;
+                cij = (t - aij) - delta;
+                aij = t;
+
+                A(pj, pi) = aij; // keep symmetry
+            }
+        }
+    }
+    if (verbose) {
+       mprintf("PivotedChol: completed at k=n=%zu, log det=% .6e\n", n, 2*logd);
+    }
+
+    return 2.0 * logd;
+}
+
+
+// --------------------------------------------------------------
+// Main exported function: automatic Gram/full switching
+// --------------------------------------------------------------
+double Analysis_EntropyHD::Stable_Schlitter_LogDet(
+        const double* Xc,   // centered & RB‑removed coordinates, (n×p)
+        const size_t  n,                // frames
+        const size_t  p,                //DOF 
+	const double *masses )  const   //sqrt mass per dof
+{
+    const double alpha = 46.03 * (temp_/300.0);
+    double      *xcmw, *xmean, minEV;  
+
+    xcmw   = dalloc( p * n );
+    xmean  = dalloc( p );
+    if (xcmw == NULL || xmean == NULL ){
+      mprinterr("failed to allocate memory for mass-weighted trajectory\n");
+      return 0.;
+    }
+
+
+    //need to re-centre as the centroid of the sub-window will
+    //different to that for the whole traj
+    for ( size_t i = 0; i < p ; i++ ){
+      xmean[i] = 0.;
+    }
+    for ( size_t f = 0; f < n; f++ ){
+      for ( size_t i = 0; i < p; i++ ){
+        xmean[i] += Xc[f*p+i];
+      }
+    }
+    for ( size_t i = 0; i < p ; i++ ){
+      xmean[i] /= n;
+    }
+    for ( size_t f = 0; f < n; f++ ){
+      for ( size_t i = 0; i < p; i++ ){
+        xcmw[f*p+i] = ( Xc[f*p+i] - xmean[i] ) * masses[i];
+      }
+    }
+    free( xmean );
+    
+
+    // --------------------------------------------
+    // Auto‑switch: Gram if n < p-6, Cov if n >= p‑6
+    // --------------------------------------------
+    bool useGram = (n < (p - 6));
+
+    if (useGram) {
+        mprintf("Stable Schlitter: using GRAM (%zu×%zu)\n", n, n);
+
+        // Form G = I + α/(n-1) * Xc Xc^T
+        std::vector<double> Gv(n*n, 0.0);
+        MatrixView G{Gv.data(), n};
+
+        const double scale = alpha / double(n - 1);
+
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t k = 0; k < p; ++k) {
+                double xik = xcmw[i*p + k];
+                for (size_t j = 0; j < n; ++j) {
+                    G(i,j) += scale * xik * xcmw[j*p + k];
+                }
+            }
+        }
+
+        // Add identity
+        for (size_t i = 0; i < n; ++i)
+            G(i,i) += 1.0;
+
+        diag_report(G, "GRAM pre-factor");
+
+        free( xcmw );
+
+        return greedy_pivoted_cholesky_logdet(G, true);
+    }
+
+    // ---------------------------------------------------------
+    // FULL COV MATRIX path: p×p
+    // ---------------------------------------------------------
+    mprintf("Stable Schlitter: guessing we have enough frames for a stable covariance matrix: (%zu×%zu)\n", p, p);
+
+    std::vector<double> Cv(p*p, 0.0);
+    MatrixView C{Cv.data(), p};
+
+    // Build covariance: Cij = sum_k Xc[k,i]*Xc[k,j] / (n-1)
+    for (size_t f = 0; f < n; ++f) {
+        const double* row = xcmw + f*p;
+        for (size_t i = 0; i < p; ++i) {
+            double xi = row[i];
+            for (size_t j = i; j < p; ++j) {
+                C(i,j) += xi * row[j];
+            }
+        }
+    }
+    double inv = 1.0 / double(n-1);
+    for (size_t i = 0; i < p; ++i)
+        for (size_t j = i; j < p; ++j) {
+            C(i,j) *= inv;
+            C(j,i) = C(i,j);
+        }
+
+    // Form M = I + α C
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t j = 0; j < p; ++j)
+            C(i,j) *= alpha;
+        C(i,i) += 1.0;
+    }
+
+    diag_report(C, "COV pre-factor");
+
+    free( xcmw );
+
+    return greedy_pivoted_cholesky_logdet(C, true);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
