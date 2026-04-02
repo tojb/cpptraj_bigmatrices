@@ -420,7 +420,8 @@ COMMON_SOURCES= \
         StructureMapper.cpp \
         SymmetricRmsdCalc.cpp \
         TextBlockBuffer.cpp \
-        TextFormat.cpp \
+	TextFormat.cpp \
+	ThermoUtils.cpp \
         Timer.cpp \
         TinkerFile.cpp \
         TopInfo.cpp \

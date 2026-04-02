@@ -113,6 +113,7 @@ CPPTRAJ_HEADERS = \
         ./Analysis_CrossCorr.h \
         ./Analysis_CurveFit.h \
         ./Analysis_Divergence.h \
+        ./Analysis_EntropyHD.h \
         ./Analysis_EvalPlateau.h \
         ./Analysis_FFT.h \
         ./Analysis.h \
@@ -478,6 +479,7 @@ CPPTRAJ_HEADERS = \
         ./SymmetricTensor.h \
         ./TextBlockBuffer.h \
         ./TextFormat.h \
+        ./ThermoUtils.h \
         ./Timer.h \
         ./TinkerFile.h \
         ./TopInfo.h \

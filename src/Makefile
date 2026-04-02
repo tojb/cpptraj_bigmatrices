@@ -16,8 +16,6 @@ ENERGY_SOURCEFILES=$(ENERGY_SOURCES:%.cpp=Energy/%.cpp)
 # All object files
 OBJECTS=$(SOURCES:.cpp=.o) $(CSOURCES:.c=.o) $(CLUSTER_SOURCEFILES:.cpp=.o) $(STRUCTURE_SOURCEFILES:.cpp=.o) $(ENERGY_SOURCEFILES:.cpp=.o)
 
-##CXXFLAGS=
-
 # General rules
 .cpp.o:
 	$(VB)echo CXX $<
@@ -51,7 +49,7 @@ install_cpptraj: cpptraj$(SFX)$(EXE)
 
 cpptraj$(SFX)$(EXE): $(OBJECTS) $(FFT_TARGET) $(READLINE_TARGET) $(CUDA_TARGET) $(XDRFILE_TARGET) $(ARPACK_TARGET) $(TNGFILE_TARGET)
 	$(VB)echo Link cpptraj$(SFX)$(EXE)
-	$(VB)$(CXX) -g -o cpptraj$(SFX)$(EXE) $(OBJECTS) $(CUDA_TARGET) $(FFT_TARGET) $(READLINE_LIB) $(CPPTRAJ_LIB) $(LDFLAGS)
+	$(VB)$(CXX) -o cpptraj$(SFX)$(EXE) $(OBJECTS) $(CUDA_TARGET) $(FFT_TARGET) $(READLINE_LIB) $(CPPTRAJ_LIB) $(LDFLAGS)
 
 # libcpptraj ---------------------------
 # Rule to make libcpptraj-specific objects

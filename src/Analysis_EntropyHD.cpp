@@ -74,18 +74,20 @@
 #include <algorithm>
 #include <cstdlib>
 
+//debug print of heap state
+#include <malloc.h>
+
 #include "CpptrajStdio.h"      // mprintf(), mprinterr()
 #include "DataSet.h"
-#include "DataSet_MatrixDbl.h"
+#include "DataSet_1D.h"
 #include "DataSetList.h"       // Dsets()
 #include "DataFileList.h"
 #include "DataSet_Coords.h"
-#include "DataSet_MatrixDbl.h"
 #include "Topology.h"
 #include "Frame.h"
 #include "AtomMask.h"
 #include "Analysis_EntropyHD.h"
-
+#include "ThermoUtils.h"
 
 static constexpr double kB   = 0.00198720425864083;   //kcal/mol/K
 static constexpr double hbar = 0.0635078          ;   //kcal*ps/mol   
@@ -94,19 +96,24 @@ static int constructor_called = 0; // For testing whether constructor is called 
 
 // --------------------------------- constructor --------------------------------------
 Analysis_EntropyHD::Analysis_EntropyHD() :
+    P_( 0 ),
+    nSelected_( 0 ),
     dsoutName_(""),
     coordsName_(""),
     maskString_(""),
-    outfileName_(""),
-    detailsName_(""),
-    temp_(300.0),
+    outfile_(nullptr),
+    temp_(300.0), 
+    pressure_(1.0),
     window_(500),
-    Coords_(nullptr),
-    outputDS_(nullptr),
-    nSelected_(0),
-    P_(0)
+    do_jacobi_(false) ,
+    mask_(), 
+    Coords_(nullptr) ,
+    AverageFrame_(),
+    MassesPerAtom_(),
+    AvgXYZ_(),
+    outputDS_(),
+    read_ptr_(0)
 {
-  
   ++constructor_called;
 }
 
@@ -117,14 +124,15 @@ void Analysis_EntropyHD::Help() const {
   mprintf("estimate the bias-corrected limit S0(n) with 95%% confidence intervals.\n\n");
   mprintf("USAGE:\n");
   mprintf("  dsout <name> [mask <atoms>] [outfile <file>] [details <file>]\n");
-  mprintf("                        [c <val>] [kb <val>] [window <frames>]\n\n");
+  mprintf("               [c <val>] [kb <val>] [temp <T>] [pressure <P>] [window <frames>] [jacobi]\n\n");
   mprintf("OPTIONS:\n");
-  mprintf("  dsout   <name>     Name of output DataSet.\n");
-  mprintf("  mask    <atoms>    AMBER atom mask to select coordinates (default: all atoms).\n");
-  mprintf("  outfile <file>     Write ASCII table with columns below (optional).\n");
-  mprintf("  details <file>     Write verbose report with parameters and results (optional).\n");
-  mprintf("  temp    <val>      Temperature in Kelvin (default 300.0).\n");
-  mprintf("  window  <frames>   Window size for n-grid; rows at n = window, 2*window, ... (default 500).\n\n");
+  mprintf("  dsout    <name>   Name of output DataSet.\n");
+  mprintf("  mask     <atoms>  AMBER atom mask to select coordinates (default: all atoms).\n");
+  mprintf("  outfile  <file>   Write entropy data to file (default: stdout).\n");
+  mprintf("  temp     <T>      Temperature in Kelvin (default 300.0).\n");
+  mprintf("  pressure <P>      Pressure in atomspheres (default 1.0).\n");
+  mprintf("  jacobi            Do a diagonalisation via Jacobi algoritm. Slow, but v. stable for long traj.\n");
+  mprintf("  window  <frames>  Window size for n-grid; rows at n = window, 2*window, ... (default 500).\n\n");
   mprintf("OUTPUT DATASET COLUMNS:\n");
   mprintf("  1) n           Frames used (ending at final frame)\n");
   mprintf("  2) S(n)        Schlitter entropy: (1/kB) * log |I + c * Cov|\n");
@@ -136,10 +144,11 @@ void Analysis_EntropyHD::Help() const {
   mprintf("                        details entropy_info.txt c 1.0 kb 1.0 window 500\n\n");
 }
 
-Analysis::RetType Analysis_EntropyHD::Setup(ArgList& al, AnalysisSetup& setup, int debugIn)
+Analysis::RetType Analysis_EntropyHD::Setup(ArgList& al, AnalysisSetup& setup, int debugFlag)
 {
 
   mprintf("Analysis_EntropyHD constructor called: %i\n", constructor_called);
+  fflush(stdout);
 
   // ---- Required: output dataset and coordinate dataset names
   dsoutName_  = al.GetStringKey("dsout");
@@ -158,25 +167,31 @@ Analysis::RetType Analysis_EntropyHD::Setup(ArgList& al, AnalysisSetup& setup, i
   } 
 
   // ---- Optional args
-  maskString_  = al.GetStringKey("mask");
-  outfileName_ = al.GetStringKey("outfile");
-  detailsName_ = al.GetStringKey("details");
+  maskString_              = al.GetStringKey("mask");
+  std::string outfilename  = al.GetStringKey("outfile");
+
   temp_        = al.getKeyDouble("temp", 300.0);
+  pressure_    = al.getKeyDouble("pressure", 1.0);
   window_      = al.getKeyInt("window", 500);
+  do_jacobi_   = al.hasKey("jacobi");
   if (window_ <= 0) window_ = 500;
 
+  //this should (neatly and silently) default to stdout.
+  {
+    std::string outfilename  = al.GetStringKey("outfile");
+    outfile_  = setup.DFL().AddCpptrajFile(outfilename, "Entropy Estimate",
+                                 DataFileList::TEXT, true);
+  }
+
   // ---- Create output dataset via AnalysisSetup::DSL()
-  DataSet* ds = setup.DSL().AddSet(DataSet::MATRIX_DBL, dsoutName_);
-  if (ds == nullptr) {
-    mprinterr("entropy_hd: Failed to create dataset '%s'.\n", dsoutName_.c_str());
+  //
+  DataSet* raw = setup.DSL().AddSet(DataSet::DOUBLE, MetaData(dsoutName_.c_str(), -1));
+  outputDS_    = dynamic_cast<DataSet_1D*>(raw);
+  if (outputDS_ == nullptr) {
+    mprinterr("entropy_hd: DataSet type is not a DataSet_1D — check AddSet type.\n");
     return Analysis::ERR;
   }
-  outputDS_ = static_cast<DataSet_MatrixDbl*>(ds);
 
-  // (Optional) If you want to attach output files here, follow built-in pattern:
-  // DataFile* ascii = setup.DFL().AddDataFile(outfileName_, al);
-  // if (ascii) ascii->AddDataSet(outputDS_);
-  
   mprintf("Analysis_EntropyHD returning OK\n");
 
   return Analysis::OK;
@@ -209,7 +224,11 @@ void Analysis_EntropyHD::ComputeMean(double* mean, const double* X, int n, int p
 // - Non-positive eigenvalues are guarded: logs a warning and returns a large
 //   negative sentinel to make the issue visible upstream.
 //
-// NOTE: This is for debugging only; Jacobi is O(n^3) with a large constant.
+// NOTE: This is for debugging or to verify stability; Jacobi is O(n^3)
+// with a large constant.
+//
+// Matrix diagonalisation is also available elsewhere in the API 
+// via "metrix thermo" command.
 // ============================================================================
 double Analysis_EntropyHD::LogDetJac(double* M, size_t max_evs ) const
 {
@@ -310,26 +329,14 @@ double Analysis_EntropyHD::LogDetJac(double* M, size_t max_evs ) const
     std::sort(evals.begin(), evals.end(), std::greater<double>());
 
     // Print a preview
-    mprintf("DEBUG(Jacobi): top eigenvalues of M (n=%d):\n", P_);
+    mprintf("Jacobi: top eigenvalues of M (n=%d):\n", P_);
     const int preview = std::min(int(P_), 32);
     for (int i = 0; i < preview; ++i)
         mprintf("  %3d : %.15e\n", i, evals[i]);
     if (P_ > (size_t)preview) mprintf("  ... (%d total eigenvalues)\n", P_);
 
-    // Compute logdet and guard non-positive eigenvalues
+    // Compute logdet ignoring non-positive eigenvalues
     double logdet = 0.0;
-    int nonpos = 0;
-    double running_total = 0.0; // For debugging Schlitter contributions
-    float  unitsFactor = ( (0.5*8.314)/(4.2*1000) ); /* convert to kcal/mol */
-
-    //const double alpha = c_local / double(n - 1);
-    ///
-    //mprintf("DEBUG: alpha(c_local/(n-1)) = %.15e (n=%d)\n", alpha, n);
-
-
-    // Optional: write all eigenvalues to file if an env var is set
-    FILE* F = std::fopen("evdump_debug.txt", "w");
-
     for (size_t i = 0; i < P_; ++i) {
 
       if( i >= max_evs && max_evs > 0 ){
@@ -337,22 +344,13 @@ double Analysis_EntropyHD::LogDetJac(double* M, size_t max_evs ) const
          break;
       }
 // Convert Jacobi eigenvalue µ_i of A = I + α C  →  covariance eigenvalue λ_i(C)
-
 // pczdump’s per-mode Schlitter term:  300 * log(1 + 46.03 * λ_i) * unitsFactor
 //const double perEv_pcz = temp_ * std::log(1.0 + 46.03 * (temp_ / 300.) * evals[i]) * unitsFactor;
 
-//      std::fprintf(F, "%.17e\n", perEv_pcz);
-
-      if (evals[i] <= 0.0) {
-        nonpos++;
-      } else {
+      if (evals[i] > 0.0) {
         logdet += std::log(1.0 + 46.03 * (temp_/300.) * evals[i]); // log(1 + α λ_i) with α=46.03@300K 
       }
     }
-    std::fclose(F);
-    if (nonpos > 0)
-        mprinterr("DEBUG(Jacobi): %d non-positive eigenvalue(s) encountered; "
-                  "logdet will be very negative.\n", nonpos);
 
     return logdet;
 }
@@ -369,12 +367,12 @@ double Analysis_EntropyHD::LogDetJac(double* M, size_t max_evs ) const
 // Complexity: O(n^2 p) to build the Gram, then O(n^3) for Cholesky.
 // This is a win whenever n << p (typical MD).
 // -----------------------------------------------------------------------------
-double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, double *masses ) const
+double Analysis_EntropyHD::SchlitterEntropy(const double* X, size_t n, double *masses ) const
 {
   // Prevent crashes on crappy inputs 
   if (X == nullptr || n <= 1 || P_ <= 0 ) return 0.0;
 
-  // --- Step 1: column means (length p) ---
+  // column means (length p) 
   double* mean = dalloc(P_);
   if (!mean) return 0.0;
 
@@ -390,8 +388,8 @@ double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, double *mass
   const double invN = 1.0 / (double)n;
   for (size_t j = 0; j < P_; ++j) mean[j] *= invN;
 
-  // --- Step 2: build A = I_n + alpha * Xc * Xc^T  (n x n SPD) ---
-  // alpha = c_local / (n-1)   (same unbiased convention as ComputeCov)
+  // build A = I_n + alpha * Xc * Xc^T  (n x n SPD) 
+  // alpha = c_local / (n-1)  
 
   mprintf("Building covariance\n");
   fflush(stdout);
@@ -425,9 +423,6 @@ double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, double *mass
     }
   }
 
-  double ld;
-
-
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
@@ -442,194 +437,55 @@ double Analysis_EntropyHD::SchlitterEntropy(const double* X, int n, double *mass
   // If numerical issues, add a tiny ridge to the diagonal and retry.
   //double ld = LogDetChol(A, n);
 
-
   mprintf("Getting log determinant of I + Cov by Jacobi\n");
-  //this is horribly slow but was useful for debug
-  //
+  //this is horribly slow but is better and more stable for number of frames >> number of DOF. 
   double *M = dalloc( P_ * P_ );
   std::memcpy(M, C, sizeof(double) * (size_t)P_ * P_);
   double ldJ = 0.;
   if (  n > P_ - 6 ){
-    //if we have more frames than degrees of freedom
-    //then the matrix should be fully determined less 6 rigid-body degrees of freedom.
-    ldJ = LogDetJac(M, P_ - 6);
+       //if we have more frames than degrees of freedom
+       //then the matrix should be fully determined less 6 rigid-body degrees of freedom.
+       ldJ = LogDetJac(M, P_ - 6);
   } else {
-    //if the matrix is underdetermined, then don't consider junk nar-zero eigenvalues.
-    ldJ = LogDetJac(M, n);
+       //if the matrix is underdetermined, then don't consider junk nar-zero eigenvalues.
+       ldJ = LogDetJac(M, n);
   }
   free( M );
   mprintf("                          via Jacobi = %.15e\n", ldJ);
   fflush(stdout);
 
-  mprintf("Getting log determinant of I + Cov by Cholesky\n");
-  fflush(stdout);
-
-
-//  ld = LogDetChol_GramOrFullCov( C, X, masses, (size_t)n);
-//  ld  = LogDetChol_FullCov( C );
-
-  ld = ldJ;
   std::free(C);
-
-  // Cleanup
   std::free(mean);
 
-  return ld;
+  return ldJ;
 }
 
-// Fit S(n) = S0 + m n^{-a}
-void Analysis_EntropyHD::LMFitBiasModel(
-  const double* nvals, const double* Svals, int K,
-  double& S0, double& m, double& a, double& SE
-) {
-  // Initial guesses
-  S0 = Svals[K - 1];
-  m  = (K >= 2 ? (Svals[0] - S0) : 0.0);
-  a  = 0.70;
 
-  // LM parameters
-  double lambda = 1e-3;
-  const int MAXIT = 80;
-  const double TOL = 1e-10;
-
-  double prevRSS = 1e300;
-
-  for (int it = 0; it < MAXIT; ++it) {
-    double JtJ[9] = {0.0}, JtR[3] = {0.0};
-    double rss = 0.0;
-
-    // Build normal equations
-    for (int k = 0; k < K; ++k) {
-      const double n   = nvals[k];
-      const double nmA = std::pow(n, -a);
-      const double pred = S0 + m * nmA;
-      const double r   = Svals[k] - pred;
-      rss += r * r;
-
-      // Jacobian wrt (S0, m, a)
-      const double dS0 = -1.0;
-      const double dm  = -nmA;
-      const double da  = -(m * nmA * (-std::log(n)));
-
-      // Accumulate J^T J
-      JtJ[0] += dS0 * dS0;  JtJ[1] += dS0 * dm;  JtJ[2] += dS0 * da;
-      JtJ[3] += dm  * dS0;  JtJ[4] += dm  * dm;  JtJ[5] += dm  * da;
-      JtJ[6] += da  * dS0;  JtJ[7] += da  * dm;  JtJ[8] += da  * da;
-
-      // Accumulate J^T r
-      JtR[0] += dS0 * r;
-      JtR[1] += dm  * r;
-      JtR[2] += da  * r;
-    }
-
-    // LM damping
-    JtJ[0] += lambda; JtJ[4] += lambda; JtJ[8] += lambda;
-
-    // Solve 3x3 system for updates (Cramer's rule / adjoint)
-    const double A=JtJ[0], B=JtJ[1], C=JtJ[2];
-    const double D=JtJ[3], E=JtJ[4], F=JtJ[5];
-    const double G=JtJ[6], H=JtJ[7], I=JtJ[8];
-
-    const double det = A*(E*I - F*H) - B*(D*I - F*G) + C*(D*H - E*G);
-    if (std::fabs(det) < 1e-18) break;
-
-    const double dx0 =
-      ( JtR[0]*(E*I - F*H) - B*(JtR[1]*I - F*JtR[2]) + C*(JtR[1]*H - E*JtR[2]) ) / det;
-    const double dx1 =
-      ( A*(JtR[1]*I - F*JtR[2]) - JtR[0]*(D*I - F*G) + C*(D*JtR[2] - JtR[1]*G) ) / det;
-    const double dx2 =
-      ( A*(E*JtR[2] - JtR[1]*H) - B*(D*JtR[2] - JtR[1]*G) + JtR[0]*(D*H - E*G) ) / det;
-
-    // Try update
-    const double newS0 = S0 + dx0;
-    const double newm  = m  + dx1;
-    const double newa  = a  + dx2;
-
-    // Optional clamping for robustness
-    double a_clamped = newa;
-    if (a_clamped < 0.10) a_clamped = 0.10;
-    if (a_clamped > 2.00) a_clamped = 2.00;
-
-    // Evaluate RSS after tentative step (cheap recompute)
-    double newRSS = 0.0;
-    for (int k = 0; k < K; ++k) {
-      const double n   = nvals[k];
-      const double nmA = std::pow(n, -a_clamped);
-      const double pred= newS0 + newm * nmA;
-      const double r   = Svals[k] - pred;
-      newRSS += r * r;
-    }
-
-    // LM accept/reject
-    if (newRSS < rss) {
-      S0 = newS0; m = newm; a = a_clamped;
-      if (std::fabs(prevRSS - newRSS) < TOL) break;
-      prevRSS = newRSS;
-      lambda *= 0.5;               // relax damping
-      if (lambda < 1e-12) lambda = 1e-12;
-    } else {
-      lambda *= 5.0;               // increase damping
-      if (lambda > 1e6) break;
-    }
-  }
-
-  // Standard error of S0 from covariance matrix
-  // Rebuild J^T J (without damping) at final params
-  double JtJ[9] = {0.0};
-  double rss = 0.0;
-  for (int k = 0; k < K; ++k) {
-    const double n   = nvals[k];
-    const double nmA = std::pow(n, -a);
-    const double pred= S0 + m * nmA;
-    const double r   = Svals[k] - pred;
-    rss += r * r;
-
-    const double dS0 = -1.0;
-    const double dm  = -nmA;
-    const double da  = -(m * nmA * (-std::log(n)));
-
-    JtJ[0] += dS0 * dS0;  JtJ[1] += dS0 * dm;  JtJ[2] += dS0 * da;
-    JtJ[3] += dm  * dS0;  JtJ[4] += dm  * dm;  JtJ[5] += dm  * da;
-    JtJ[6] += da  * dS0;  JtJ[7] += da  * dm;  JtJ[8] += da  * da;
-  }
-
-  // (J^T J)^{-1}_{00}
-  const double A=JtJ[0], B=JtJ[1], C=JtJ[2];
-  const double D=JtJ[3], E=JtJ[4], F=JtJ[5];
-  const double G=JtJ[6], H=JtJ[7], I=JtJ[8];
-  const double DET = A*(E*I - F*H) - B*(D*I - F*G) + C*(D*H - E*G);
-  const double cof00 = (E*I - F*H);
-
-  const double dof = (double)(K - 3);
-  const double sigma2 = (dof > 0.0 ? rss / dof : 0.0);
-  const double varS0  = (DET != 0.0 ? sigma2 * (cof00 / DET) : 0.0);
-  SE = (varS0 > 0.0 ? std::sqrt(varS0) : 0.0);
-}
-
-// -------------------------------- Analyze ------------------------------------
+// Analyze
 Analysis::RetType Analysis_EntropyHD::Analyze() {
-  // ---------------------------------------
-  // 1. Validate coordinate data
-  // ---------------------------------------
+
+
+  // 
+  // Validate coordinate data
+  // 
   if (Coords_ == nullptr) {
     mprinterr("entropy_hd: No coordinate DataSet loaded.\n");
     return Analysis::ERR;
   }
 
-  const Topology& top = Coords_->Top(); // Get topology reference from coordinates dataset... sometimes this is passed as a pointer....
-  const int N      = Coords_->Size();   // number of frames
+  const Topology& top = Coords_->Top();  // Get topology reference from coordinates dataset
+  const int N         = Coords_->Size(); // number of frames
 
   mprintf("entropy_hd: running on coordinate set '%s' with %zu frames and %u dimensions.\n",
             coordsName_.c_str(), Coords_->Size(), Coords_->Ndim());
-  
-
   if (N < window_) {
     mprinterr("entropy_hd: Not enough frames (%d) for window=%d.\n", N, window_);
     return Analysis::ERR;
   }
 
+
   // ---------------------------------------
-  // 2. Setup atom mask
+  // Setup atom mask
   // ---------------------------------------
   if (!maskString_.empty()) {
     if (mask_.SetMaskString(maskString_) != 0) {
@@ -640,42 +496,54 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
     // default = all atoms
     mask_.SetMaskString("@*");
   }
-
+  
   // Now apply mask to topology
   if (top.SetupIntegerMask(mask_) != 0) {
     mprinterr("entropy_hd: Failed to apply mask to topology.\n");
     return Analysis::ERR;
   }
-
+  mask_.MaskInfo();
+  if( mask_.None() ) {
+    mprinterr("Error: mask [%s] is somehow None.\n", mask_.MaskString());
+    return Analysis::ERR;
+  }
   nSelected_ = mask_.Nselected();
   if (nSelected_ <= 0) {
     mprinterr("entropy_hd: Mask selects zero atoms.\n");
     return Analysis::ERR;
   }
+  
   //get a mass vector for mass-weighting covariance later.
   P_ = 3 * nSelected_;
-  
+
   // ------------------------------------------------------------
   // Build per-coordinate mass vector (length p = 3*nSelected_)
   // ------------------------------------------------------------
-  std::vector<double> massVec(P_);   // p = 3*nSelected_
+  std::vector<double> massVec(P_);   // P_ = 3*nSelected_
+  std::vector<Atom>   atsInMask;
+  atsInMask.reserve( nSelected_ );
   for (int si = 0; si < nSelected_; si++) {
     int atom = mask_[si];
     double m = top[atom].Mass();          // mass in amu
 
     // Basic sanity check for hydrogens
     if (top[atom].AtomicNumber() == 1 && m > 2.01) {
-        mprinterr("entropy_hd: Hydrogen atom mass %.2f > 2.01; suspect topology?\n", m);
+        mprinterr("entropy_hd: Hydrogen atom mass %.2f > 2.01; suspect topology?\n");
+        mprinterr("    If you used HMR then you have to reverse it before calculating an entropy. Quitting.\n", m);
         return Analysis::ERR;
     }
-    // Each atom contributes three coordinate entries
-    massVec[3*si + 0] = std::sqrt(m);
-    massVec[3*si + 1] = std::sqrt(m);
-    massVec[3*si + 2] = std::sqrt(m);
+    // Assume that each atom contributes three coordinate entries
+    massVec[3*si + 0]   = std::sqrt(m);
+    massVec[3*si + 1]   = std::sqrt(m);
+    massVec[3*si + 2]   = std::sqrt(m);
+
+    atsInMask.push_back( top[atom] );
   }
+ 
+
 
   // ---------------------------------------
-  // 3) Stage selected coordinates into memory,
+  // Stage selected coordinates into memory,
   // align and centre
   // ---------------------------------------
   mprintf("allocating memory for coordinate matrix X with %d rows and %d columns...\n", N, P_);
@@ -683,21 +551,31 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   if (X == nullptr) {
     mprinterr("entropy_hd: Failed to allocate memory for coordinate matrix.\n");
     return Analysis::ERR;
+  } else {
+    mprintf("dalloc'd. Aligning coordinates:\n");
   }
+
+
+  //this saves the average coordinates to AverageFrame_
   BuildAlignedCoordinates(Coords_, mask_, X);
-  
+  mprintf("Aligned.\n");
+
+  //for convenience, the AverageFrame has unit mass atoms
+  //because all the averaging is geometric, but we set them
+  //to have real masses for the rigid body stuff later.
+  AverageFrame_.SetMass( atsInMask );
+  //after this point, shouldn't need to reference anything to do with the mask: have all masses and coords.
 
   // ---------------------------------------
-  // 4. Compute Schlitter constant c(T) in AMBER units
+  // Compute Schlitter constant c(T) in AMBER units
   // ---------------------------------------
   static constexpr double kB_kcal     = 0.00198720425864083;
   static constexpr double hbar_kcalps = 0.0635078;
-//  const double c_local = (kB_kcal * temp_) / (hbar_kcalps * hbar_kcalps);
 
   // ---------------------------------------
-  // 5. Compute number of windows
+  // Compute number of windows
   // ---------------------------------------
-  int K = N / window_;
+  size_t K = N / window_;
  
   mprintf("using %d windows of size %d\n", K, window_);
   if ( K < 3 ) {
@@ -709,95 +587,66 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   std::vector<double> nvals(K), Svals(K);
 
   // ---------------------------------------
-  // 6. Compute S(n) for each prefix
+  // Compute S(n) for each window over the trajectory 
+  //
+  // TODO: make a circular buffer instead of always
+  // counting windows from the start of the trajectory?
   // ---------------------------------------
   const double entropy_units = 0.5 * (8.314 / 4200.0);
-  const double min_TS        = 0.01; //minimum free energy contribution to consider an eigenmode.
-  for (int i = 0; i < K; ++i) {
-    int n = (i + 1) * window_;
-
-    mprintf("doing schlitter for window %d with %d frames\n", i + 1, n);
-
+  for (size_t i = 0; i < K; ++i) {
+    size_t n = (i + 1) * window_;
     double ld;
     ld = Stable_Schlitter_LogDet( X, n, P_, massVec.data() );
-    mprintf("Got log determinant: %f\n", ld);
-
-    mprintf("Comparison for debug\n");
-    ld = SchlitterEntropy( X, n, massVec.data() );
-    mprintf("Jacobi log determinant: %f\n", ld);
+    if ( do_jacobi_ ) {
+      mprintf(" log determinant by Cholesky: %f\n", ld);
+      ld = SchlitterEntropy( X, n, massVec.data() );
+      mprintf("Jacobi log determinant: %f\n . Saving Jacobi as it was requested.", ld);
+    }
 
     Svals[i] = entropy_units * temp_ * ld; // free-energy units (kcal/mol);
     nvals[i] = (double)n;
 
     mprintf("window %d: n=%d frames, S(n)=%.4f kcal/mol @ T=%.1f K\n", i + 1, n, Svals[i], temp_);
+    fflush( stdout );
 
   }
 
-  // ---------------------------------------
-  // 7. LM fit for each n_i and write K time points to DataSet
-  // ---------------------------------------
-  outputDS_->Allocate2D((size_t)K, 5);
-  for (int i = 3; i < K; ++i) {
-    int Ki = i + 1;
-
-    double S0 = 0.0, m = 0.0, a = 0.0, SE = 0.0;
-    LMFitBiasModel(nvals.data(), Svals.data(), Ki, S0, m, a, SE);
-
-    double CIlo = S0 - 1.96*SE;
-    double CIhi = S0 + 1.96*SE;
-
-    outputDS_->SetElement(i, 0, nvals[i]);
-    outputDS_->SetElement(i, 1, Svals[i]);
-    outputDS_->SetElement(i, 2, S0);
-    outputDS_->SetElement(i, 3, CIlo);
-    outputDS_->SetElement(i, 4, CIhi);
-    mprintf("ongoing estimate of configurational entropy at window %i: S0 = %.4f with 95%% CI (%.4f, %.4f)\n", 
-       i, outputDS_->GetElement(i, 2), outputDS_->GetElement(i, 3), outputDS_->GetElement(i, 4));
-  }
-  mprintf("final estimate of configurational entropy S0 = %.4f with 95%% CI (%.4f, %.4f)\n", 
-       outputDS_->GetElement(K-1, 2), outputDS_->GetElement(K-1, 3), outputDS_->GetElement(K-1, 4));
-
-  // ---------------------------------------
-  // 8. Optional ASCII output
-  // ---------------------------------------
-  if (!outfileName_.empty()) {
-    FILE* F = fopen(outfileName_.c_str(), "w");
-    if (F) {
-      fprintf(F, "##Harris-Dryden entropy estimator: \n");
-      fprintf(F, "# n   S(n)   S0(n)   CIlo   CIhi\n");
-      for (int i = 0; i < K; ++i)
-        fprintf(F, "%d %.12f %.12f %.12f %.12f\n",
-                (int)nvals[i],
-                outputDS_->GetElement(i,1), outputDS_->GetElement(i,2),
-                outputDS_->GetElement(i,3), outputDS_->GetElement(i,4));
-      fclose(F);
-    }
+  // write K time points to DataSet
+  outputDS_->SetDim(Dimension::X, Dimension(nvals[0], window_, "X"));
+  for (size_t i = 0; i < K; ++i) {
+    outputDS_->Add(i, &Svals[i]);
   }
 
-  // ---------------------------------------
-  // 9. Optional save out detailed report
-  // ---------------------------------------
-  if (!detailsName_.empty()) {
-    FILE* F = fopen(detailsName_.c_str(), "w");
-    if (F) {
-      fprintf(F, "#Harris-Dryden unbiased entropy estimator given time series of Molecular Dynamics Frames:\n");
-      fprintf(F, "#References:\n");
-      fprintf(F, "#   - Dryden, Kume, Le, Wood (Stat. inference for functions of covariance...,\n");
-      fprintf(F, "#     Sections 4.1–4.2, Schlitter entropy and bias behavior).  \n");
-      fprintf(F, "#   - Harris et al. (2001) empirical bias scaling for S(nr S(n). \n");
-      fprintf(F, "#Mask: %s\n", maskString_.empty() ? "<all atoms>" : maskString_.c_str());
-      fprintf(F, "#Selected atoms: %i (P=%lu)\n", nSelected_, P_);
-      fprintf(F, "#Temp=%.1f K  window=%d  frames=%d\n\n", temp_, window_, N);
-      fprintf(F, "#n     S(n)        S0(n)       CIlo        CIhi\n");
-      for (int i = 0; i < K; ++i)
-        fprintf(F, "%d %.6f %.6f %.6f %.6f\n",
-                (int)nvals[i],
-                outputDS_->GetElement(i,1), outputDS_->GetElement(i,2),
-                outputDS_->GetElement(i,3), outputDS_->GetElement(i,4));
+  // build thermo-style output of rotational and translational energy and entropy
+  // and save out detailed report
+  outfile_->Printf( "#Harris-Dryden unbiased entropy estimator given time series of Molecular Dynamics Frames:\n");
+  outfile_->Printf( "#References:\n");
+  outfile_->Printf( "#   - Dryden, Kume, Le, Wood (Stat. inference for functions of covariance...,\n");
+  outfile_->Printf( "#     Sections 4.1–4.2, Schlitter entropy and bias behavior).  \n");
+  outfile_->Printf( "#   - Harris et al. (2001) empirical bias scaling for S(nr S(n). \n");
+  outfile_->Printf( "#Mask: %s\n", maskString_.empty() ? "<all atoms>" : maskString_.c_str());
+  outfile_->Printf( "#Selected atoms: %i (P=%lu)\n", nSelected_, P_);
 
-      fclose(F);
-    }
-  }
+  ////////Header printout and rigid body stuff (common to entropy calculators) is taken care of by ThermoUtils
+  //pack state into this ThermoInput structure, and pass it as an argument
+  ThermoUtils::ThermoInput tin;
+  tin.masses_amu       = &MassesPerAtom_; //pass by reference of vector.
+  tin.avg_coords       = &AvgXYZ_;        //pass by reference of vector.
+  tin.freqs_cm1        = nullptr;   //this method doesn't generate a spectrum
+  tin.nmodes           = 0;         //no modes
+  tin.temperature      = temp_;     //scalar
+  tin.pressure_atm     = pressure_; //scalar
+
+  //print out the thermochemistry
+  ThermoUtils::ComputeThermochemistry( *outfile_, tin, 0 );
+
+
+  outfile_->Printf("\n#####Configurational entropy estimate versus time (better sampling makes the entropy appear larger)\n");
+  outfile_->Printf(  "#below timeseries converges (probably) as S(t) = S_inf( 1 - exp(-B * t))...\n");
+  outfile_->Printf(  "#  : the user is advised to estimate the value S_inf using 'regress YourDataSetName model expsat'\n");
+  outfile_->Printf(  "#n     S(n)        \n");
+  for (size_t i = 0; i < K; ++i)
+     outfile_->Printf( "%lu %.6f\n", (long unsigned int)nvals[i], Svals[i]);
 
   std::free(X);
   return Analysis::OK;
@@ -812,48 +661,54 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
     const int nFrames = Coords_->Size();
     const int nSel    = mask_.Nselected();
     const int p       = 3 * nSel;
+    Frame     ref, fr;
 
-    // First-pass mean (Cartesian), second-pass mean 
-    std::vector<double> avg1(p, 0.0);
-
-    Frame ref, fr, avgFr;
     ref.SetupFrameFromMask(mask_);
     fr.SetupFrameFromMask(mask_);
-    avgFr.SetupFrameFromMask(mask_);
 
     // -----------------------------------------------------------
-    // PASS 1: align to frame 0 and accumulate Cartesian average
+    // First pass: align to frame 0 and accumulate Cartesian average
     // -----------------------------------------------------------
-    Coords_->GetFrame(0, ref);
+    Coords_->GetFrame(0, ref, mask_);
 
+try {
+    AvgXYZ_.resize(p, 0.); 
+} catch (const std::bad_alloc& e)  {
+    mprinterr("couldn't allocate a vector of %i doubles \n", p );
+    exit( 1 );
+}
     for (int f = 0; f < nFrames; f++) {
-        Coords_->GetFrame(f, fr);
-        fr.Align(ref, mask_);
+        Coords_->GetFrame(f, fr, mask_);
+
+        fr.Align(ref, mask_);   
 
         for (int si = 0; si < nSel; si++) {
             const double* xyz = fr.XYZ(si);
-            avg1[3*si + 0] += xyz[0];
-            avg1[3*si + 1] += xyz[1];
-            avg1[3*si + 2] += xyz[2];
+            AvgXYZ_[3*si + 0] += xyz[0];
+            AvgXYZ_[3*si + 1] += xyz[1];
+            AvgXYZ_[3*si + 2] += xyz[2];
         }
     }
 
+
     const double invN = 1.0 / double(nFrames);
-    for (int j = 0; j < p; j++) avg1[j] *= invN;
+    for (int j = 0; j < p; j++) AvgXYZ_[j] *= invN;
 
     // -----------------------------------------------------------
-    // Build average frame from first-pass mean (Cartesian)
+    // Build average frame as a "Frame" object from first-pass mean
+    // NB it is not clear if this is a copy-by-ref: better keep the mass vector
+    // and the AvgXYZ_ in scope for the rest of the analysis.
     // -----------------------------------------------------------
-    {
-        std::vector<double> dummyMass(nSel, 1.0);
-        avgFr.SetupFrameXM(avg1, dummyMass);
-    }
+
+    MassesPerAtom_.resize(nSel, 1.0);
+    AverageFrame_.SetupFrameXM(AvgXYZ_, MassesPerAtom_); //use unit mass initially, for geometric averaging only.
 
     // -----------------------------------------------------------
-    // PASS 2: align to avgFr, then:
+    // Second pass: align to avgFr, then:
     //   - remove translation (COM),
     //   - remove rotation via projection (3 rotational modes),
-    //   - store in Xmw.
+    //   - store aligned frames in X.
+    //   - also store average coordinates (for thermo).
     // -----------------------------------------------------------
 #pragma omp parallel
     {
@@ -869,10 +724,17 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
 
 #pragma omp for schedule(static)
         for (int f = 0; f < nFrames; f++) {
-            Coords_->GetFrame(f, local);
-            local.Align(avgFr, mask_);
+	
+//marking the GetFrame as critical because I'm not sure if it mutates state inside the coords reader.
+#pragma omp critical
+		{
+            Coords_->GetFrame(f, local, mask_);
+		}
 
-            // ---------- (1) Translation removal:  COM ----------
+            local.Align(AverageFrame_, mask_); //because we copied the average coordinates into the Frame object, 
+	                               //we can use API functions like Align()
+
+            // ---------- Translation removal:  COM ----------
             // COM = sum(m_i * x_i) / sum(m_i)
             double comX = 0.0, comY = 0.0, comZ = 0.0;
             for (int si = 0; si < nSel; si++) {
@@ -884,7 +746,7 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
             comX /= nSel; comY /= nSel; comZ /= nSel;
             
 
-            // ---------- (2) Build centered y and rotational bases Bx,By,Bz ----------
+            // ---------- Build centered y and rotational bases Bx,By,Bz ----------
             // r_i = x_i - COM; y(3si:3si+2) = sqrt(m_i)*r_i
             // b_x = sqrt(m_i) * ( e_x × r ) = sqrt(m_i) * ( 0, -r_z, r_y )
             // b_y = sqrt(m_i) * ( e_y × r ) = sqrt(m_i) * ( r_z, 0, -r_x )
@@ -895,7 +757,6 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
                 const double ry = xyz[1] - comY;
                 const double rz = xyz[2] - comZ;
                 const int jx = 3*si;
-
 
                 // centered coordinates
                 y[jx+0] =  rx;
@@ -916,7 +777,7 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
                 Bz[jx+2] =  0.0;
             }
 
-            // ---------- (3) Build Gram G = B^T B and rhs = B^T y (3x3 and 3x1) ----------
+            // ---------- Build Gram G = B^T B and rhs = B^T y (3x3 and 3x1) ----------
             // G = [ <Bx,Bx>, <Bx,By>, <Bx,Bz>;
             //       <By,Bx>, <By,By>, <By,Bz>;
             //       <Bz,Bx>, <Bz,By>, <Bz,Bz> ]
@@ -935,7 +796,7 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
 
             rhs[0]=rBx; rhs[1]=rBy; rhs[2]=rBz;
 
-            // ---------- (4) Solve G c = rhs (3x3) with tiny Tikhonov regularization ----------
+            // ----------  Solve G c = rhs (3x3) with tiny Tikhonov regularization ----------
             // Add a small ridge in case the geometry is near-degenerate (e.g., nearly linear subset)
             const double eps = 1e-12;
             G[0]+=eps; G[4]+=eps; G[8]+=eps;
@@ -965,11 +826,11 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
                 c[0]=c[1]=c[2]=0.0;
             }
 
-            // ---------- (5) Project rotation: y <- y - (c0*Bx + c1*By + c2*Bz) ----------
+            // ---------- Project rotation: y <- y - (c0*Bx + c1*By + c2*Bz) ----------
             for (int j = 0; j < p; j++)
                 y[j] = y[j] - (c[0]*Bx[j] + c[1]*By[j] + c[2]*Bz[j]);
 
-            // ---------- (6) Store RB-removed coordinates ----------
+            // ---------- Store RB-removed coordinates ----------
             double* row = X + (size_t)f * p;
             for (int j = 0; j < p; j++) row[j] = y[j];
         }
@@ -978,53 +839,55 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
     // -----------------------------------------------------------
     // SECOND-PASS MEAN and CENTERING
     // -----------------------------------------------------------
-    std::fill(avg1.begin(), avg1.end(), 0.0);
+    // could probably, if pushed, re-use the space AvgXYZ_ which was previously
+    // calculated
+    std::vector<double> Avg2XYZ( p );
+    for (int j = 0; j < p; j++) Avg2XYZ[j] = 0.0;
 
     int nThreads = 1;
 #pragma omp parallel
     {
 #pragma omp single
-        nThreads = omp_get_num_threads();
+      nThreads = omp_get_num_threads();
     }
 
     std::vector<std::vector<double>> threadSum(nThreads, std::vector<double>(p, 0.0));
 
 #pragma omp parallel
     {
-        int tid = omp_get_thread_num();
-        double* local = threadSum[tid].data();
+      int tid = omp_get_thread_num();
+      double* local = threadSum[tid].data();
 
 #pragma omp for schedule(static)
-        for (int f = 0; f < nFrames; f++) {
-            const double* row = X + (size_t)f * p;
-            for (int j = 0; j < p; j++)
-                local[j] += row[j];
-        }
+      for (int f = 0; f < nFrames; f++) {
+         const double* row = X + (size_t)f * p;
+         for (int j = 0; j < p; j++)
+           local[j] += row[j];
+      }
     }
-
     for (int t = 0; t < nThreads; t++)
-        for (int j = 0; j < p; j++)
-            avg1[j] += threadSum[t][j];
+      for (int j = 0; j < p; j++)
+        Avg2XYZ[j] += threadSum[t][j];
 
+    //reduce over threads to get the Cartesian (not mw)
+    //centred and aligned coordinates.
     for (int j = 0; j < p; j++)
-        avg1[j] *= invN;
+      Avg2XYZ[j] *= invN;
 
 #pragma omp parallel for schedule(static)
     for (int f = 0; f < nFrames; f++) {
-        double* row = X + (size_t)f * p;
-        for (int j = 0; j < p; j++)
-            row[j] -= avg1[j];
+      double* row = X + (size_t)f * p;
+      for (int j = 0; j < p; j++)
+        row[j] -= Avg2XYZ[j];
     }
 
-    mprintf("Aligned, rigid-body removed, and centered: %d frames × %d dims.\n",
-            nFrames, p);
+    //save the average frame. Maybe even export this as an output?
+    //NB this might well not be neccessary as the AvgXYZ_ buffer was already linked into 
+    //the AverageFrame_ object but it isn't expensive so do it anyway. 
+    for( int i = 0; i < nSel; i++ ){
+      AverageFrame_.SetXYZ( i, Vec3( Avg2XYZ[3*i], Avg2XYZ[3*i+1], Avg2XYZ[3*i+2] ) );
+    }
 }
-
-
-
-
-
-
 
 
 // --------------------------------------------------------------
@@ -1069,10 +932,12 @@ static void diag_report(const MatrixView& A, const char* tag) {
         gersh_min = std::min(gersh_min, di - radius);
     }
 
-    mprintf(">>> DIAG(%s): n=%zu  nonpos_diag=%zu  min_diag=% .6e  max_diag=% .6e\n",
-            tag, n, nonpos_diag, min_diag, max_diag);
-    mprintf("              max|A-A^T|=% .6e  max|off|=% .6e  Gershgorin_min=% .6e\n",
-            max_asym, max_off, gersh_min);
+//technical estimates of matrix stability
+//    mprintf(">>> DIAG(%s): n=%zu  nonpos_diag=%zu  min_diag=% .6e  max_diag=% .6e\n",
+//            tag, n, nonpos_diag, min_diag, max_diag);
+//    mprintf("              max|A-A^T|=% .6e  max|off|=% .6e  Gershgorin_min=% .6e\n",
+//            max_asym, max_off, gersh_min);
+
 }
 
 
@@ -1082,7 +947,7 @@ static void diag_report(const MatrixView& A, const char* tag) {
 // --------------------------------------------------------------
 static double greedy_pivoted_cholesky_logdet(
         MatrixView& A,
-        bool verbose = true,
+        bool verbose = false,
         double eps_pivot = 1e-12)
 {
     const size_t n = A.n;
@@ -1178,10 +1043,11 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
         const double* Xc,   // centered & RB‑removed coordinates, (n×p)
         const size_t  n,                // frames
         const size_t  p,                //DOF 
-	const double *masses )  const   //sqrt mass per dof
+	const double *masses )   //sqrt mass per dof
 {
     const double alpha = 46.03 * (temp_/300.0);
-    double      *xcmw, *xmean, minEV;  
+    double      *xcmw, *xmean;  
+    size_t       ptr_save;
 
     xcmw   = dalloc( p * n );
     xmean  = dalloc( p );
@@ -1196,21 +1062,33 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     for ( size_t i = 0; i < p ; i++ ){
       xmean[i] = 0.;
     }
+
+    //collect frames from a circular buffer up to the number
+    //specified. Maximising independence of data.
+    ptr_save = read_ptr_;
     for ( size_t f = 0; f < n; f++ ){
       for ( size_t i = 0; i < p; i++ ){
-        xmean[i] += Xc[f*p+i];
+        xmean[i] += Xc[read_ptr_*p+i];
       }
+      read_ptr_ += 1;
+      if ( read_ptr_ >= n ) read_ptr_ = 0;
     }
+    read_ptr_ = ptr_save; //reset the circular buffer.
+
     for ( size_t i = 0; i < p ; i++ ){
       xmean[i] /= n;
     }
+
+    //repeat the pass over the circular buffer and collect centred frames.
     for ( size_t f = 0; f < n; f++ ){
       for ( size_t i = 0; i < p; i++ ){
-        xcmw[f*p+i] = ( Xc[f*p+i] - xmean[i] ) * masses[i];
+        xcmw[f*p+i] = ( Xc[read_ptr_*p+i] - xmean[i] ) * masses[i];
       }
+      read_ptr_ += 1;
+      if ( read_ptr_ >= n ) read_ptr_ = 0;
     }
     free( xmean );
-    
+    //do not reset the buffer again.
 
     // --------------------------------------------
     // Auto‑switch: Gram if n < p-6, Cov if n >= p‑6
@@ -1218,7 +1096,6 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     bool useGram = (n < (p - 6));
 
     if (useGram) {
-        mprintf("Stable Schlitter: using GRAM (%zu×%zu)\n", n, n);
 
         // Form G = I + α/(n-1) * Xc Xc^T
         std::vector<double> Gv(n*n, 0.0);
@@ -1226,63 +1103,88 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
 
         const double scale = alpha / double(n - 1);
 
+	#pragma omp parallel for schedule(static)
+	//outer loop is over frames i
         for (size_t i = 0; i < n; ++i) {
-            for (size_t k = 0; k < p; ++k) {
-                double xik = xcmw[i*p + k];
-                for (size_t j = 0; j < n; ++j) {
-                    G(i,j) += scale * xik * xcmw[j*p + k];
-                }
-            }
-        }
+	    size_t ii;
+	    ii = ((i + ptr_save) % n) * p;
 
-        // Add identity
-        for (size_t i = 0; i < n; ++i)
-            G(i,i) += 1.0;
+	    //copy the outer-loop frame into cache, 
+	    //hope that it fits per-thread.
+            std::vector<double> xi(p);
+            for (size_t k = 0; k < p; ++k) xi[k] = xcmw[ii+k];
 
-        diag_report(G, "GRAM pre-factor");
+	    //inner loop over frames j, should synchronise such that all
+	    //threads load the same inner set of frames to cache.
+	    for (size_t j = 0; j < n; ++j) {
+              size_t jj  = ((j + ptr_save) % n) * p;
+              double sum = 0.;
+
+              //now loop over degrees of freedom for the frame-pair.
+              for (size_t k = 0; k < p; ++k) {
+                double xjk  =  xcmw[jj + k];
+                sum        +=  xi[k] * xjk;
+              }
+	      G(i,j) = sum * scale;
+           }
+	   //add identity
+	   G(i,i) += 1.0;
+       }
+
+//        diag_report(G, "GRAM pre-factor");
 
         free( xcmw );
 
-        return greedy_pivoted_cholesky_logdet(G, true);
+        return greedy_pivoted_cholesky_logdet( G );
     }
 
     // ---------------------------------------------------------
     // FULL COV MATRIX path: p×p
     // ---------------------------------------------------------
-    mprintf("Stable Schlitter: guessing we have enough frames for a stable covariance matrix: (%zu×%zu)\n", p, p);
+ //   mprintf("Stable Schlitter: guessing we have enough frames for a stable covariance matrix: (%zu×%zu)\n", p, p);
 
     std::vector<double> Cv(p*p, 0.0);
     MatrixView C{Cv.data(), p};
-
-    // Build covariance: Cij = sum_k Xc[k,i]*Xc[k,j] / (n-1)
-    for (size_t f = 0; f < n; ++f) {
-        const double* row = xcmw + f*p;
-        for (size_t i = 0; i < p; ++i) {
-            double xi = row[i];
-            for (size_t j = i; j < p; ++j) {
-                C(i,j) += xi * row[j];
-            }
-        }
-    }
-    double inv = 1.0 / double(n-1);
-    for (size_t i = 0; i < p; ++i)
-        for (size_t j = i; j < p; ++j) {
-            C(i,j) *= inv;
-            C(j,i) = C(i,j);
-        }
-
-    // Form M = I + α C
+    
+    // Build covariance: C(i,j) = sum_f row_f[i] * row_f[j]
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < p; ++i) {
-        for (size_t j = 0; j < p; ++j)
-            C(i,j) *= alpha;
-        C(i,i) += 1.0;
+      for (size_t j = i; j < p; ++j) {
+        double sum = 0.0;
+        // accumulate over frames: all threads should load new frames in synchrony,
+	// so although it means a lot (N2) of frame loads at least they aren't fighting each other.
+        for (size_t f = 0; f < n; ++f) {
+            const double* row = xcmw + f*p;
+            sum += row[i] * row[j];
+        }
+        C(i,j) = sum;
+      }
     }
 
-    diag_report(C, "COV pre-factor");
+    // symmetrise and scale 
+    double scaled_inv = alpha / double(n-1);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < p; ++i) {
+      for (size_t j = i; j < p; ++j) {
+        double v = C(i,j) * scaled_inv;
+        C(i,j) = v;
+        C(j,i) = v;
+      }
+    }
+
+    // add Identity.
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < p; ++i) {
+      C(i,i) += 1.0;
+    }
+
+
+
+  //  diag_report(C, "COV pre-factor");
 
     free( xcmw );
 
-    return greedy_pivoted_cholesky_logdet(C, true);
+    return greedy_pivoted_cholesky_logdet( C );
 }
 
 

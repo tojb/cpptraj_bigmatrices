@@ -1,7 +1,4 @@
 #include "DataSet_MatrixFlt.h"
-#include "CpptrajStdio.h"
-
-#include <cstdlib>  // for malloc/free
 void DataSet_MatrixFlt::WriteBuffer(CpptrajFile& outfile, SizeArray const& pIn) const {
   size_t x = (size_t)pIn[0];
   size_t y = (size_t)pIn[1];
@@ -12,26 +9,9 @@ void DataSet_MatrixFlt::WriteBuffer(CpptrajFile& outfile, SizeArray const& pIn) 
 }
 
 double* DataSet_MatrixFlt::MatrixArray() const {
-  size_t nelt = mat_.size();
-  if (nelt == 0) return nullptr;
-
-  size_t bytes = nelt * sizeof(double);
-
-  double* matOut = static_cast<double*>(std::malloc(bytes));
-  if (!matOut) {
-    mprinterr("Out of memory allocating %zu bytes for matrix\n", bytes);
-    return nullptr;
-  }
-
-  float const* src = mat_.Ptr();
-  if (!src) {
-    mprinterr("Internal error: matrix has %zu elements but data pointer is null\n", nelt);
-    free(matOut);
-    return nullptr;
-  }
-  for (size_t i = 0; i < nelt; ++i)
-    matOut[i] = (double)src[i];
-  
+  double* matOut = new double[ mat_.size() ];
+  for (size_t i = 0; i < mat_.size(); ++i)
+    matOut[i] = (double)mat_[i];
   return matOut;
 }
 

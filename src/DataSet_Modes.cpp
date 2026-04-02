@@ -5,11 +5,9 @@
 #include "DataSet_2D.h"
 #include "DataSet_MatrixDbl.h"
 #include "Frame.h"
-#include "ProgressBar.h"
 #include <cmath> // sqrt, fabs
 #include <algorithm> // std::sort
-#include <cstdio>
-#include <ctime> // time, localtime, strftime
+#include "ThermoUtils.h" //printout and trivial/rigid-body terms.
 
 #ifndef NO_MATHLIB
 // Definition of Fortran subroutines called from this class
@@ -42,9 +40,7 @@ DataSet_Modes::DataSet_Modes() :
   vecsize_(0),
   reduced_(false),
   evecsAreMassWtd_(false),
-  evalsAreFreq_(false),
-  checkpointFile_(),
-  checkpointEnabled_(false)
+  evalsAreFreq_(false)
 {}
 
 // DESTRUCTOR
@@ -59,7 +55,7 @@ size_t DataSet_Modes::MemUsageInBytes() const {
                   (mass_.size() * sizeof(double)) +
                   (2 * sizeof(double*)) +
                   (2 * sizeof(int)) +
-                  (4 * sizeof(bool));
+                  (3 * sizeof(bool));
   if (evalues_ != 0)
     mySize += ((size_t)nmodes_ * sizeof(double));
   if (evectors_ != 0)
@@ -222,23 +218,7 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
     nmodes_ = ncols;
     mprintf("Warning: Only calculating %i eigenmodes.\n", nmodes_);
   }
-  bool calcAll        = (nmodes_ == ncols);
-  
-  // If checkpointing is enabled, force use of iterative Arnoldi method
-  // since the direct diagonalization (dspev) cannot be checkpointed
-  if (checkpointEnabled_) {
-    if (calcAll) {
-      mprintf("\tCheckpointing enabled: will use iterative Arnoldi method for all %i modes.\n", ncols);
-      calcAll = false; // Force iterative method
-    } else {
-      mprintf("\tCheckpointing enabled: using iterative Arnoldi method to calculate %i of %i modes.\n", nmodes_, ncols);
-    }
-#   ifdef NO_ARPACK
-    mprinterr("Error: Checkpointing requires ARPACK support (compiled without it).\n");
-    return 1;
-#   endif
-  }
-  
+  bool calcAll = (nmodes_ == ncols);
 # ifdef NO_ARPACK
   if (!calcAll) {
     mprintf("Warning: Compiled without ARPACK. All %i modes must be calculated, may be slow.\n",
@@ -362,25 +342,9 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
     // for matrices/vectors used by the Lanczos iteration.
     int ipntr[11];
     std::fill( ipntr, ipntr + 11, 0 );
-    // Create copy of matrix since it will be modified 
-    double* mat = mIn.MatrixArray();
+    // Copy of matrix mat was created above since it will be modified by dsaupd_
     // LOOP
     bool loop = false;
-    // Progress tracking: use ARPACK's max-iteration iparam[2] as a guide.
-    // iparam[5] (1-based) -> iparam[4] (0-based) is NCONV: number of converged Ritz values.
-    // iparam[9] (1-based) -> iparam[8] (0-based) is NUMOP: total number of OP*x (matrix-vector products).
-    ProgressBar progress( iparam[2] );
-    int last_nconv = 0;
-    // Attempt to load checkpoint if enabled
-    if (checkpointEnabled_) {
-      int nconv_loaded = CheckpointLoad(nelem, ncv, lworkl,
-                                        ido, iparam, ipntr, resid, eigenvectors,
-                                        workd, workl, evalues_);
-      if (nconv_loaded > 0) {
-        last_nconv = nconv_loaded;
-        loop = (ido == -1 || ido == 1); // Set loop based on restored ido
-      }
-    }
     do {
       if (loop) {
         // Dot products
@@ -401,27 +365,6 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
               ncv, eigenvectors, nelem, iparam, ipntr, workd, workl,
               lworkl, info);
       loop = (ido == -1 || ido == 1);
-
-      // Compute residual norm (resid is length nelem). This gives an
-      // inexpensive indicator of the current subspace quality.
-      double rnorm = 0.0;
-      for (int ri = 0; ri < nelem; ++ri) 
-          rnorm += resid[ri] * resid[ri];
-      rnorm = std::sqrt( rnorm );
-      // Use iparam[8] (0-based) for matrix-vector product count and iparam[4]
-      // for number of converged Ritz values.
-      int mvprod = (iparam[8] >= 0 ? iparam[8] : -1);
-      int nconv  = (iparam[4] >= 0 ? iparam[4] : 0);
-      if (mvprod >= 0) progress.Update( mvprod );
-      // Print only when a new mode (Ritz value) has converged.
-      if (nconv > last_nconv) {
-        mprintf("\tArnoldi: found %d modes (resid_norm=%.6e, mv=%d)\n", nconv, rnorm, mvprod);
-        // Save checkpoint on progress
-        CheckpointSave(nelem, ncv, lworkl, ido, iparam, ipntr, resid,
-                       eigenvectors, workd, workl, evalues_);
-        last_nconv = nconv;
-      }
-
     } while ( loop ); // END LOOP
 
     if (info != 0) {
@@ -436,10 +379,6 @@ int DataSet_Modes::CalcEigen(DataSet_2D const& mIn, int n_to_calc) {
               ncv, eigenvectors, nelem, iparam, ipntr, workd, workl,
               lworkl, info);
       delete[] select;
-      // If checkpointing was used and we converged successfully, remove checkpoint file
-      if (info == 0) {
-        CheckpointDelete();
-      }
     } 
     delete[] mat;
     delete[] workl;
@@ -583,179 +522,6 @@ void DataSet_Modes::MultiplyEvecByFac(int nvec, double fac) {
   double* evec = evectors_ + (nvec * vecsize_);
   for (int jj = 0; jj < vecsize_; jj++)
     evec[jj] *= fac;
-}
-
-// DataSet_Modes::CheckpointLoad()
-// Attempt to load checkpoint state from file during Arnoldi iteration.
-// Returns: number of converged modes on success, 0 or negative on failure.
-// Sets ido to the saved reverse-communication flag.
-// Note: File I/O only on master rank in MPI; OpenMP-safe (serial I/O).
-int DataSet_Modes::CheckpointLoad(int nelem, int ncv, int lworkl,
-                                  int& ido, int* iparam, int* ipntr, double* resid, double* eigenvectors,
-                                  double* workd, double* workl, double* evalues_)
-{
-  if (!checkpointEnabled_) return 0;
-
-#ifdef MPI
-  // Only master rank reads checkpoint file to avoid I/O conflicts
-  if (!Parallel::World().Master()) return 0;
-#endif
-  
-  FileName const& chkfn = checkpointFile_;
-  if (chkfn.empty() || !File::Exists(chkfn)) return 0;
-  
-  FILE* f = fopen(chkfn.Full().c_str(), "rb");
-  if (!f) {
-    mprintf("\tNo existing checkpoint '%s' for reading.\n", chkfn.Full().c_str());
-    return -1;
-  }
-  
-  // Read human-readable header (text line starting with '#')
-  char header_line[256] = {0};
-  int c;
-  int idx = 0;
-  while ((c = fgetc(f)) != '\n' && c != EOF && idx < 255) {
-    header_line[idx++] = (char)c;
-  }
-  header_line[idx] = '\0';
-  
-  char magic[8] = {0};
-  if ((size_t)7 != fread(magic, 1, 7, f)) {
-    mprintf("\tCheckpoint '%s': failed to read magic.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  int version = 0;
-  if ((size_t)1 != fread(&version, sizeof(int), 1, f)) {
-    mprintf("\tCheckpoint '%s': failed to read version.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  int nelem_chk = 0, ncv_chk = 0, nmodes_chk = 0;
-  if ((size_t)1 != fread(&nelem_chk, sizeof(int), 1, f) ||
-      (size_t)1 != fread(&ncv_chk, sizeof(int), 1, f) ||
-      (size_t)1 != fread(&nmodes_chk, sizeof(int), 1, f)) {
-    mprintf("\tCheckpoint '%s': failed to read sizes.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  if (nelem_chk != nelem || ncv_chk != ncv) {
-    mprintf("\tCheckpoint '%s' incompatible (sizes differ); ignoring.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  if ((size_t)1 != fread(&ido, sizeof(int), 1, f) ||
-      (size_t)11 != fread(iparam, sizeof(int), 11, f) ||
-      (size_t)11 != fread(ipntr, sizeof(int), 11, f)) {
-    mprintf("\tCheckpoint '%s': failed to read ido/iparam/ipntr.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  if ((size_t)nelem != fread(resid, sizeof(double), nelem, f) ||
-      (size_t)(ncv * nelem) != fread(eigenvectors, sizeof(double), ncv * nelem, f) ||
-      (size_t)(3 * nelem) != fread(workd, sizeof(double), 3 * nelem, f) ||
-      (size_t)lworkl != fread(workl, sizeof(double), lworkl, f) ||
-      (size_t)nelem != fread(evalues_, sizeof(double), nelem, f)) {
-    mprintf("\tCheckpoint '%s': failed to read workspace arrays.\n", chkfn.Full().c_str());
-    fclose(f);
-    return 0;
-  }
-  
-  fclose(f);
-  
-  int nconv = (iparam[4] >= 0 ? iparam[4] : 0);
-  mprintf("\tLoaded checkpoint '%s'\n\t  %s\n\t  ido=%d, mv=%d\n",
-          chkfn.Full().c_str(), header_line, ido,
-          (iparam[8] >= 0 ? iparam[8] : -1));
-  
-  return nconv;
-}
-
-// DataSet_Modes::CheckpointSave()
-// Save checkpoint state to file during Arnoldi iteration.
-// Note: File I/O only on master rank in MPI; OpenMP-safe (serial I/O);
-//       Compatible with any LAPACK/BLAS backend (MKL, OpenBLAS, etc.)
-void DataSet_Modes::CheckpointSave(int nelem, int ncv, int lworkl, int ido,
-                                   const int* iparam, const int* ipntr, const double* resid,
-                                   const double* eigenvectors, const double* workd,
-                                   const double* workl, const double* evalues_)
-{
-  if (!checkpointEnabled_) return;
-
-#ifdef MPI
-  // Only master rank writes checkpoint file to avoid I/O conflicts
-  if (!Parallel::World().Master()) return;
-#endif
-  
-  FileName const& chkfn = checkpointFile_;
-  if (chkfn.empty()) return;
-  
-  FILE* f = fopen(chkfn.Full().c_str(), "wb");
-  if (!f) {
-    mprintf("\tFailed to open checkpoint '%s' for writing.\n", chkfn.Full().c_str());
-    return;
-  }
-  
-  // Write human-readable header line with metadata
-  time_t now = time(0);
-  struct tm* loctime = localtime(&now);
-  char time_str[32];
-  strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", loctime);
-  int nconv = (iparam[4] >= 0 ? iparam[4] : 0);
-  int mvprod = (iparam[8] >= 0 ? iparam[8] : -1);
-  int iter = (iparam[2] >= 0 ? iparam[2] : -1);
-  fprintf(f, "# Arnoldi checkpoint: %s | modes=%d converged=%d iter=%d mv=%d ido=%d\n",
-          time_str, nmodes_, nconv, iter, mvprod, ido);
-  
-  // Binary checkpoint format: magic, version, sizes, ido, iparam, ipntr, resid, eigenvectors, workd, workl, evalues_
-  const char* magic = "ARPKCHK";
-  bool write_ok = true;
-  if ((size_t)7 != fwrite(magic, 1, 7, f)) write_ok = false;
-  int version = 1;
-  if ((size_t)1 != fwrite(&version, sizeof(int), 1, f)) write_ok = false;
-  if ((size_t)1 != fwrite(&nelem, sizeof(int), 1, f)) write_ok = false;
-  if ((size_t)1 != fwrite(&ncv, sizeof(int), 1, f)) write_ok = false;
-  if ((size_t)1 != fwrite(&nmodes_, sizeof(int), 1, f)) write_ok = false;
-  if ((size_t)1 != fwrite(&ido, sizeof(int), 1, f)) write_ok = false;
-  if ((size_t)11 != fwrite(iparam, sizeof(int), 11, f)) write_ok = false;
-  if ((size_t)11 != fwrite(ipntr, sizeof(int), 11, f)) write_ok = false;
-  if ((size_t)nelem != fwrite(resid, sizeof(double), nelem, f)) write_ok = false;
-  if ((size_t)(ncv * nelem) != fwrite(eigenvectors, sizeof(double), ncv * nelem, f)) write_ok = false;
-  if ((size_t)(3 * nelem) != fwrite(workd, sizeof(double), 3 * nelem, f)) write_ok = false;
-  if ((size_t)lworkl != fwrite(workl, sizeof(double), lworkl, f)) write_ok = false;
-  if ((size_t)nelem != fwrite(evalues_, sizeof(double), nelem, f)) write_ok = false;
-  fclose(f);
-  
-  if (write_ok)
-    mprintf("\tCheckpoint written to '%s' (%d converged, %d mv)\n", chkfn.Full().c_str(), nconv, mvprod);
-  else
-    mprintf("\tWarning: incomplete checkpoint write to '%s'\n", chkfn.Full().c_str());
-}
-
-// DataSet_Modes::CheckpointDelete()
-// Delete checkpoint file after successful convergence.
-// Note: File deletion only on master rank in MPI; OpenMP-safe (serial I/O).
-void DataSet_Modes::CheckpointDelete()
-{
-  if (!checkpointEnabled_) return;
-
-#ifdef MPI
-  // Only master rank deletes checkpoint file
-  if (!Parallel::World().Master()) return;
-#endif
-  
-  FileName const& chkfn = checkpointFile_;
-  if (chkfn.empty() || !File::Exists(chkfn)) return;
-  
-  if (remove(chkfn.Full().c_str()) == 0)
-    mprintf("\tCheckpoint '%s' deleted after convergence.\n", chkfn.Full().c_str());
-  else
-    mprintf("\tWarning: failed to delete checkpoint '%s'\n", chkfn.Full().c_str());
 }
 
 /// Class used to sort eigenvalue/index pairs
@@ -938,6 +704,8 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
     mprinterr("Internal Error: DataSet_Modes::Thermo: Expected eigenvalues as cm^-1\n");
     return 1;
   }
+  
+
   // avgcrd_   Contains coordinates in Angstroms
   // mass_     Contains masses in amu.
   // nmodes_   Number of eigenvectors (already converted to frequencies)
@@ -966,32 +734,17 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
     mprinterr("Internal Error: DataSet_Modes::Thermo(): output file is not open.\n");
     return 1;
   }
-  
-  //     print the temperature and pressure.
-  outfile.Printf("\n                    *******************\n");
-  outfile.Printf(  "                    - Thermochemistry -\n");
-  outfile.Printf(  "                    *******************\n\n");
-  outfile.Printf("\n temperature %9.3f kelvin\n pressure    %9.5f atm\n",temp,patm);
-  double pressure = pstd * patm;
-  double rt = Constants::GASK_J * temp;
-
-  //     compute and print the molecular mass in amu, then convert to
+  //     compute the molecular mass in amu, then convert to
   //     kilograms.
   double weight = 0.0;
   for (Darray::const_iterator m = mass_.begin(); m != mass_.end(); ++m)
     weight += *m;
-  outfile.Printf(" molecular mass (principal isotopes) %11.5f amu\n", weight);
   weight *= Constants::AMU_TO_KG;
-  
-  //trap non-unit multiplicities.
-  //if (multip != 1) {
-  //  outfile.Printf("\n Warning-- assumptions made about the electronic partition function\n");
-  //  outfile.Printf(  "           are not valid for multiplets!\n\n");
-  //}
-  //     compute contributions due to translation:
-  //        etran-- internal energy
-  //        ctran-- constant v heat capacity
-  //        stran-- entropy
+
+
+  double pressure = pstd * patm;
+  double rt = Constants::GASK_J * temp;
+
   double dum1 = boltz * temp;
   double dum2 = pow(Constants::TWOPI, 1.5);
   double arg = pow(dum1, 1.5) / planck;
@@ -1002,31 +755,6 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
   double etran = 1.5 * rt;
   double ctran = 1.5 * Constants::GASK_J;
 
-  //     Compute contributions due to electronic motion:
-  //        It is assumed that the first electronic excitation energy
-  //        is much greater than kt and that the ground state has a
-  //        degeneracy of one.  Under these conditions the electronic
-  //        partition function can be considered to be unity.  The
-  //        ground electronic state is taken to be the zero of
-  //        electronic energy.
-
-  //     for monatomics print and return.
-  if (avgcrd_.size() <= 3){
-    outfile.Printf("\n internal energy:   %10.3f joule/mol         %10.3f kcal/mol\n",
-           etran, etran * tokcal);
-    outfile.Printf(  " entropy:           %10.3f joule/k-mol       %10.3f cal/k-mol\n",
-           stran, stran * tocal);
-    outfile.Printf(  " heat capacity cv:  %10.3f joule/k-mol       %10.3f  cal/k-mol\n",
-           ctran, ctran * tocal);
-    return 0;
-  }
-
-  Frame AVG;
-  AVG.SetupFrameXM( avgcrd_, mass_ );
-  // Allocate workspace memory
-  // vtemp   vibrational temperatures, in kelvin.
-  // evibn   contribution to e from the vibration n.
-  // cvibn   contribution to cv from the vibration n.
   // svibn   contribution to s from the vibration n.
   double* WorkSpace = new double[ 4 * nmodes_ ];
   double* vtemp = WorkSpace;
@@ -1034,73 +762,22 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
   double* cvibn = WorkSpace + nmodes_*2;
   double* svibn = WorkSpace + nmodes_*3;
 
-  //     compute contributions due to rotation.
-
-  //     Compute the principal moments of inertia, get the rotational
-  //     symmetry number, see if the molecule is linear, and compute
-  //     the rotational temperatures.  Note the imbedded conversion
-  //     of the moments to SI units.
-  Matrix_3x3 Inertia;
-  AVG.CalculateInertia( AtomMask(0, AVG.Natom()), Inertia );
-  // NOTE: Diagonalize_Sort sorts evals/evecs in descending order, but
-  //       thermo() expects ascending.
-  // pmom      principal moments of inertia, in amu-bohr**2 and in ascending order.
-  Vec3 pmom;
-  Inertia.Diagonalize_Sort( pmom );
-  rtemp = pmom[0];
-  pmom[0] = pmom[2];
-  pmom[2] = rtemp;
-  outfile.Printf("\n principal moments of inertia (nuclei only) in amu-A**2:\n");
-  outfile.Printf(  "      %12.2f%12.2f%12.2f\n", pmom[0], pmom[1], pmom[2]);
-
   bool linear = false;
   // Symmetry number: only for linear molecules. for others symmetry number is unity
   double sn = 1.0;
-  if (AVG.Natom() <= 2) {
+  if (avgcrd_.size() <= 6) { //fewer than 3 atoms
     linear = true;
-    if (AVG.Mass(0) == AVG.Mass(1)) sn = 2.0;
+    if (mass_[0] == mass_[1]) sn = 2.0;
   }
-  outfile.Printf("\n rotational symmetry number %3.0f\n", sn);
 
   double con = planck / (boltz*8.0*pipi);
   con = (con / Constants::AMU_TO_KG)  *  (planck / (tomet*tomet));
-  if (linear) {
-    rtemp = con / pmom[2];
-    if (rtemp < 0.2) {
-      outfile.Printf("\n Warning-- assumption of classical behavior for rotation\n");
-      outfile.Printf(  "           may cause significant error\n");
-    }
-    outfile.Printf("\n rotational temperature (kelvin) %12.5f\n", rtemp);
-  } else {
-    rtemp1 = con / pmom[0];
-    rtemp2 = con / pmom[1];
-    rtemp3 = con / pmom[2];
-    if (rtemp1 < 0.2) {
-      outfile.Printf("\n Warning-- assumption of classical behavior for rotation\n");
-      outfile.Printf(  "           may cause significant error\n");
-    }
-    outfile.Printf("\n rotational temperatures (kelvin) %12.5f%12.5f%12.5f\n",
-           rtemp1, rtemp2, rtemp3);
-  }
 
   //         erot-- rotational contribution to internal energy.
   //         crot-- rotational contribution to cv.
   //         srot-- rotational contribution to entropy.
   double erot, crot, srot;
 
-  if (linear) {
-     erot = rt;
-     crot = Constants::GASK_J;
-     arg  = (temp/rtemp) * (e/sn);
-     srot = Constants::GASK_J * log(arg);
-  } else {
-     erot = 1.5 * rt;
-     crot = 1.5 * Constants::GASK_J;
-     arg  = sqrt(Constants::PI*e*e*e) / sn;
-     double dum  = (temp/rtemp1) * (temp/rtemp2) * (temp/rtemp3);
-     arg  = arg * sqrt(dum);
-     srot = Constants::GASK_J * log(arg);
-  }
 
   //     compute contributions due to vibration.
 
@@ -1120,8 +797,6 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
      iff = 5;
   else
      iff = 6;
-  if (iff > 0)
-    outfile.Printf("The first %i frequencies will be skipped.\n", iff);
   con = planck / boltz;
   double ezpe = 0.0;
   for (int i = 0; i < ndof; ++i) {
@@ -1129,35 +804,11 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
      ezpe    += evalues_[i+iff] * 3.0e10;
   }
   ezpe = 0.5 * planck * ezpe;
-  outfile.Printf("\n zero point vibrational energy %12.1f (joules/mol) \n"
-                   "                               %12.5f (kcal/mol)\n"
-                   "                               %12.7f (hartree/particle)\n",
-                   ezpe*Constants::NA, ezpe*tokcal*Constants::NA, ezpe/hartre);
-  //     compute the number of vibrations for which more than 5% of an
-  //     assembly of molecules would exist in vibrational excited states.
-  //     special printing for these modes is done to allow the user to
-  //     easily take internal rotations into account.  the criterion
-  //     corresponds roughly to a low frequency of 1.9(10**13) hz, or
-  //     625 cm**(-1), or a vibrational temperature of 900 k.
-
-  int lofreq = 0;
-  for (int i = 0; i < ndof; ++i)
-    if (vtemp[i] < thresh)
-      ++lofreq;
-  if (lofreq != 0) {
-    outfile.Printf("\n Warning-- %3i vibrations have low frequencies and may represent hindered \n",
-           lofreq);
-    outfile.Printf(  "         internal rotations.  The contributions printed below assume that these \n");
-    outfile.Printf(  "         really are vibrations.\n");
-  }
-
+  
   //     compute:
   //        evib-- the vibrational component of the internal energy.
   //        cvib-- the vibrational component of the heat capacity.
   //        svib-- the vibrational component of the entropy.
-  double evib = 0.0;
-  double cvib = 0.0;
-  double svib = 0.0;
   double scont;
   for (int i = 0; i < ndof; ++i) {
      //       compute some common factors.
@@ -1183,59 +834,40 @@ int DataSet_Modes::Thermo( CpptrajFile& outfile, int ilevel, double temp, double
      cvibn[i] = ccont * Constants::GASK_J;
      svibn[i] = scont * Constants::GASK_J;
      //       end if
-     evib += econt;
-     cvib += ccont;
-     svib += scont;
   }
-  evib *= rt;
-  cvib *= Constants::GASK_J;
-  svib *= Constants::GASK_J;
 
   //     the units are now:
   //         e-- joules/mol
   //         c-- joules/mol-kelvin
   //         s-- joules/mol-kelvin
-  double etot, ctot, stot;
-  //etot = etran + erot + evib;
-  //ctot = ctran + crot + cvib;
-  //stot = stran + srot + svib;
 
   //     print the sum of the hartree-fock energy and the thermal energy.
-
-  //     call tread(501,gen,47,1,47,1,0)
-  //     esum = gen(32) + etot/avog/hartre
-  //     write(iout,1230) esum
 
   //     convert to the following and print
   //         e-- kcal/mol
   //         c-- cal/mol-kelvin
   //         s-- cal/mol-kelvin
-  etran = etran * tokcal;
-  ctran = ctran * tocal;
-  stran = stran * tocal;
-  erot   = erot * tokcal;
-  crot   = crot * tocal;
-  srot   = srot * tocal;
-  evib   = evib * tokcal;
-  cvib   = cvib * tocal;
-  svib   = svib * tocal;
-  etot   = etran + erot + evib;
-  ctot   = ctran + crot + cvib;
-  stot   = stran + srot + svib;
   for (int i = 0; i < ndof; ++i) {
      evibn[i] *= tokcal;
      cvibn[i] *= tocal;
      svibn[i] *= tocal;
   }
 
-  outfile.Printf("\n\n           freq.         E                  Cv                 S\n");
-  outfile.Printf(    "          cm**-1      kcal/mol        cal/mol-kelvin    cal/mol-kelvin\n");
-  outfile.Printf(    "--------------------------------------------------------------------------------\n");
-  outfile.Printf(    " Total              %11.3f        %11.3f        %11.3f\n",etot,ctot,stot);
-  outfile.Printf(    " translational      %11.3f        %11.3f        %11.3f\n",etran,ctran,stran);
-  outfile.Printf(    " rotational         %11.3f        %11.3f        %11.3f\n",erot,crot,srot);
-  outfile.Printf(    " vibrational        %11.3f        %11.3f        %11.3f\n",evib,cvib,svib);
+  ////////Header printout and rigid body stuff (common to entropy calculators) is taken care of by ThermoUtils
+  //pack DataSet_Modes state into this structure, and pass it as an argument
+  ThermoUtils::ThermoInput tin;
+  tin.masses_amu       = &mass_;   //pass by reference of vector.
+  tin.avg_coords       = &avgcrd_; //pass by reference of vector.
+  tin.freqs_cm1        = evalues_; //this is alreagy just a nice simple pointer to double.
+  tin.nmodes           = nmodes_;  //scalar
+  tin.temperature      = temp;     //scalar
+  tin.pressure_atm     = patm;     //scalar
 
+  //print out the thermochemistry
+  ThermoUtils::ComputeThermochemistry( outfile, tin, ilevel );
+
+
+  //here we supply mode-based decomposition output.
   for (int i = 0; i < iff; ++i)
     outfile.Printf(" %5i%10.3f\n", i+1, evalues_[i]);
 

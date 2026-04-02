@@ -1,6 +1,4 @@
 #include "DataSet_MatrixDbl.h"
-#include "CpptrajStdio.h"
-#include <cstdlib>  // for malloc/free
 void DataSet_MatrixDbl::WriteBuffer(CpptrajFile& outfile, SizeArray const& pIn) const {
   size_t x = (size_t)pIn[0];
   size_t y = (size_t)pIn[1];
@@ -11,25 +9,8 @@ void DataSet_MatrixDbl::WriteBuffer(CpptrajFile& outfile, SizeArray const& pIn) 
 }
 
 double* DataSet_MatrixDbl::MatrixArray() const {
-  size_t nelt = mat_.size();
-  if (nelt == 0) return nullptr;
-
-  size_t bytes = nelt * sizeof(double);
-
-  /* use malloc so we can test for a nullptr rather than throwing */
-  double* matOut = static_cast<double*>(std::malloc(bytes));
-  if (!matOut) {
-    mprinterr("Out of memory allocating %zu bytes for matrix\n", bytes);
-    return nullptr;
-  }
-
-  double const* src = mat_.Ptr();
-  if (!src) {
-    mprinterr("Internal error: matrix has %zu elements but data pointer is null\n", nelt);
-    free(matOut);
-    return nullptr;
-  }
-  std::copy(src, src + nelt, matOut);
+  double* matOut = new double[ mat_.size() ];
+  std::copy( mat_.Ptr(), mat_.Ptr() + mat_.size(), matOut );
   return matOut;
 }
 

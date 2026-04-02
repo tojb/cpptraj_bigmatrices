@@ -572,25 +572,17 @@ Analysis::RetType Analysis_Regression::Analyze() {
       // same X as input
       for (int i=0;i<N;i++) {
         const double yfit = model_->Evaluate(x[i], params);
-	if( i == 0 ){
-	   mprintf(" evaluated at i==0 f(%.3f)=%.3f\n", x[i], yfit );
-	}
         mesh->AddXY(x[i], yfit);
       }
     } else {
-
       // uniform grid min..max
       double xmin = x[0], xmax = x[0];
       for (int i=1;i<N;i++) { xmin = std::min(xmin, x[i]); xmax = std::max(xmax, x[i]); }
-      mprintf(" grid determined as  %.3f ... %.3f\n", xmin, xmax);
       const double step = (xmax - xmin) / (double)(nx_ - 1);
       double xv = xmin;
       for (int i=0;i<nx_;i++) {
         const double yv = model_->Evaluate(xv, params);
 	out->Add( i, &yv );
-        if( i < 10 ){
-          mprintf(" evaluated AT i==0 f(%.3f)=%.3f\n", xv, yv);
-        }
         xv += step;
       }
       out->SetDim( Dimension::X, Dimension(xmin, step, "X"));
