@@ -161,6 +161,7 @@ COMMON_SOURCES= \
         ByteRoutines.cpp \
         CharMask.cpp \
         CharmmParamFile.cpp \
+        ChowLiuTree_Entropy.cpp \
         CIFfile.cpp \
         ClusterMap.cpp \
         Cmd.cpp \

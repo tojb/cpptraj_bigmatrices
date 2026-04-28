@@ -8,6 +8,17 @@
 #include "AtomMask.h"
 #include <string>
 
+//function to calculate mutual information 
+//based on variance/covariance of a pair of matrix 
+//blocks.
+struct MatrixView;
+double mutual_information_logdet(
+    const MatrixView& Cfull,
+    const std::vector<size_t>& A,
+    const std::vector<size_t>& B,
+    bool verbose = false,
+    double eps_pivot = 1e-12);
+
 class Analysis_EntropyHD : public Analysis {
 public:
   Analysis_EntropyHD();

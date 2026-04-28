@@ -170,6 +170,7 @@ CPPTRAJ_HEADERS = \
         ./ByteRoutines.h \
         ./CharMask.h \
         ./CharmmParamFile.h \
+        ./ChowLiuTree_Entropy.h \
         ./CIFfile.h \
         ./ClusterMap.h \
         ./Cmd.h \

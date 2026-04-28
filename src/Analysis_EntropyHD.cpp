@@ -72,7 +72,12 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 #include <cstdlib>
+#include <cstdint>
+#include <unordered_map>
+#include <cassert>
+#include <memory>
 
 //debug print of heap state
 #include <malloc.h>
@@ -80,6 +85,7 @@
 #include "CpptrajStdio.h"      // mprintf(), mprinterr()
 #include "DataSet.h"
 #include "DataSet_1D.h"
+#include "DataSet_Modes.h"
 #include "DataSetList.h"       // Dsets()
 #include "DataFileList.h"
 #include "DataSet_Coords.h"
@@ -87,14 +93,87 @@
 #include "Frame.h"
 #include "AtomMask.h"
 #include "Analysis_EntropyHD.h"
+
+//utility files used only/mainly by the entropy code
 #include "ThermoUtils.h"
+#include "ChowLiuTree_Entropy.h"
+
+//this is a convenient debug macro to test heap integrity.
+#define DBG
+#ifdef __DBG
+#define HD_HEAP_POKE(); do { \
+  void* _p = malloc(16); \
+  if (!_p) abort(); \
+  memset(_p, 0xcc, 16); \
+  free(_p); \
+  fprintf(stderr, "HP @ %s:%d\n", __FILE__, __LINE__); \
+  fflush(stderr); \
+} while(0)
+#else
+#define HD_HEAP_POKE(); ;
+#endif
+
+
+//local function(s) not exposed:
+//
+//Efficient log determinant
+static double greedy_pivoted_cholesky_logdet( MatrixView& A, bool verbose = false, double eps_pivot = 1e-12);
+
+//1D and low-D blockwise corrections for mutual information and non-Gaussian distribution, beyond variance/covariance.
+double block_1d_negentropy_correction(const double* Xc, size_t n_frames,  size_t p, const std::vector<size_t>& block_dofs );
+double histogram_entropy_1d(const double* x, size_t n, double mean, double var ); //1D histogram for Shannon entropy.
+
+std::vector<Edge>
+compute_mi_candidates_parallel(const MatrixView&              C,
+                               const std::vector<TreeNode*>&  active,//search these nodes.
+                               const std::vector<Edge>&       edges, //search these edges.
+                               const MergeParams&             P);
+
+//////////////////////////////////////////////////////////////
+// Central kernel of this approach:
+// Computes NEW non-Gaussian entropy corrections introduced by merging blocks A and B
+// Assumes:
+//   - internal H(A), H(B) already harvested, so individual blocks are now multivariate Gaussians.
+//   - A.dofs and B.dofs are disjoint
+// Returns:
+//   - An entropy correction Sng_merge >= 0.
+//
+// Why are we doing this? Because Schlitter entropy is a good bound for systems which are 
+// Gaussian. To tighten the bound, we look at deviations from Gaussian.
+//
+// 1-dof deviations can come from a 1D Shannon entropy, but N-dimensional Shannon is hard. 
+//
+// We find the N-body deviations in NlogN merges going up a tree
+// constructed heuristically to harvest the most information at the lowest levels.
+//
+/////   
+double sng2_merge_cca(
+  const double*             Xc,        // centered data (n_frames × p)
+  size_t                    n_frames,
+  size_t                    p,
+  const TreeNode&           A,
+  const TreeNode&           B,
+  size_t                    max_modes  = 3, // truncate CCA (practical)
+  double                    eps        = 1e-8);
+
+
+
+
+//2D entropy correction based on moments (Kurtosis) applied to a single graph edge
+//This function is serial.
+double block_2d_moments_correction(const double* Xc,
+                                   size_t        n_frames,
+                                   size_t        p,
+                                   const         TreeNode*             u,
+				   const         TreeNode*             v);
 
 static constexpr double kB   = 0.00198720425864083;   //kcal/mol/K
 static constexpr double hbar = 0.0635078          ;   //kcal*ps/mol   
 
 static int constructor_called = 0; // For testing whether constructor is called in unit tests. Remove when no longer needed.
 
-// --------------------------------- constructor --------------------------------------
+// Constructor for the main class, required by cpptraj convention
+// ...most defaults are overwritten later in Setup()
 Analysis_EntropyHD::Analysis_EntropyHD() :
     P_( 0 ),
     nSelected_( 0 ),
@@ -117,7 +196,7 @@ Analysis_EntropyHD::Analysis_EntropyHD() :
   ++constructor_called;
 }
 
-// -------------------------------- Help ---------------------------------------
+// Help text. Automatically picked up for documentation(?), and output.
 void Analysis_EntropyHD::Help() const {
   mprintf("\nAnalysis entropy_hd : Bias-corrected Schlitter entropy (Harris–Dryden)\n");
   mprintf("Compute Schlitter entropy S(n) over increasing trajectory lengths and\n");
@@ -183,8 +262,7 @@ Analysis::RetType Analysis_EntropyHD::Setup(ArgList& al, AnalysisSetup& setup, i
                                  DataFileList::TEXT, true);
   }
 
-  // ---- Create output dataset via AnalysisSetup::DSL()
-  //
+  //Create output dataset via AnalysisSetup::DSL()
   DataSet* raw = setup.DSL().AddSet(DataSet::DOUBLE, MetaData(dsoutName_.c_str(), -1));
   outputDS_    = dynamic_cast<DataSet_1D*>(raw);
   if (outputDS_ == nullptr) {
@@ -464,7 +542,9 @@ double Analysis_EntropyHD::SchlitterEntropy(const double* X, size_t n, double *m
 // Analyze
 Analysis::RetType Analysis_EntropyHD::Analyze() {
 
-
+#ifdef DBG
+  HD_HEAP_POKE();
+#endif
   // 
   // Validate coordinate data
   // 
@@ -540,7 +620,9 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
     atsInMask.push_back( top[atom] );
   }
  
-
+#ifdef DBG
+        HD_HEAP_POKE();
+#endif
 
   // ---------------------------------------
   // Stage selected coordinates into memory,
@@ -554,7 +636,6 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   } else {
     mprintf("dalloc'd. Aligning coordinates:\n");
   }
-
 
   //this saves the average coordinates to AverageFrame_
   BuildAlignedCoordinates(Coords_, mask_, X);
@@ -594,6 +675,10 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
   // ---------------------------------------
   const double entropy_units = 0.5 * (8.314 / 4200.0);
   for (size_t i = 0; i < K; ++i) {
+#ifdef DBG
+        HD_HEAP_POKE();
+#endif
+
     size_t n = (i + 1) * window_;
     double ld;
     ld = Stable_Schlitter_LogDet( X, n, P_, massVec.data() );
@@ -889,22 +974,9 @@ try {
     }
 }
 
-
-// --------------------------------------------------------------
-// Helper: lightweight matrix accessor (const + mutable)
-// --------------------------------------------------------------
-struct MatrixView {
-    double* data;
-    size_t n;
-    inline double& operator()(size_t r, size_t c) {
-        return data[r*n + c];
-    }
-    inline const double& operator()(size_t r, size_t c) const {
-        return data[r*n + c];
-    }
-};
-
-// Gershgorin + diag + symmetry diagnostics
+// Gershgorin + diag + symmetry diagnostics, mainly for debug
+// but can be of scientific interest if discussing conditioning of matrices.
+//
 static void diag_report(const MatrixView& A, const char* tag) {
     size_t n = A.n;
     size_t nonpos_diag = 0;
@@ -941,103 +1013,177 @@ static void diag_report(const MatrixView& A, const char* tag) {
 }
 
 
+//quick utility structure to create a dense submatrix
+struct OwnedMatrix {
+  std::vector<double> buf;
+  MatrixView view;
+
+  explicit OwnedMatrix(size_t n)
+        : buf(n*n, 0.0), view{buf.data(), n} {}
+
+  double& operator()(size_t i, size_t j) {
+        return buf[i*view.n + j];
+  }
+};
+
+//utility function copy a submatrix from
+//a larger matrix and return the copy as an
+//"OwnedMatrix"
+OwnedMatrix extract_subcov(
+    const MatrixView& Cfull,
+    const std::vector<size_t>& idx)
+{
+  const size_t m = idx.size();
+  OwnedMatrix C(m);
+
+  for (size_t i = 0; i < m; ++i)
+    for (size_t j = 0; j < m; ++j)
+      C(i,j) = Cfull(idx[i], idx[j]);
+
+  return C;
+}
+
+
+
+//wrapper for Cholesky det calculation:
+//pass a covariance matrix and a vector of DOF indices
+double block_entropy_logdet(
+    const MatrixView& Cfull,
+    const std::vector<size_t>& dof,
+    bool verbose = false,
+    double eps_pivot = 1e-12)
+{
+  //copy-out a dense submatrix to work with.
+  OwnedMatrix C = extract_subcov(Cfull, dof);
+
+  // greedy_pivoted_cholesky_logdet overwrites C.view
+  return greedy_pivoted_cholesky_logdet(C.view, verbose, eps_pivot);
+}
+
+
+
+//find entropy minus mutual information
+//for joint matrix Cfull, minus submatrices indexed by A and B.
+double mutual_information_logdet(
+    const MatrixView& Cfull,
+    const std::vector<size_t>& A,
+    const std::vector<size_t>& B,
+    bool verbose,
+    double eps_pivot)
+{
+  std::vector<size_t> AB;
+  AB.reserve(A.size() + B.size());
+  AB.insert(AB.end(), A.begin(), A.end());
+  AB.insert(AB.end(), B.begin(), B.end());
+
+  const double logA  = block_entropy_logdet(Cfull, A,  verbose, eps_pivot);
+  const double logB  = block_entropy_logdet(Cfull, B,  verbose, eps_pivot);
+  const double logAB = block_entropy_logdet(Cfull, AB, verbose, eps_pivot);
+
+  return 0.5 * (logA + logB - logAB);
+}
+
+
+
+
 // --------------------------------------------------------------
 // Kahan‑compensated greedy pivoted Cholesky + log det
 // Works for both Gram and Cov matrices
 // --------------------------------------------------------------
 static double greedy_pivoted_cholesky_logdet(
         MatrixView& A,
-        bool verbose = false,
-        double eps_pivot = 1e-12)
+        bool verbose,
+        double eps_pivot)
 {
-    const size_t n = A.n;
+  const size_t n = A.n;
 
-    // Permutation vector
-    std::vector<size_t> piv(n);
-    for (size_t i = 0; i < n; ++i) piv[i] = i;
+  // Permutation vector
+  std::vector<size_t> piv(n);
+  for (size_t i = 0; i < n; ++i) piv[i] = i;
 
-    // Triangular compensation buffer
-    std::vector<double> comp(n*(n+1)/2, 0.0);
-    auto idxT = [&](size_t i, size_t j) -> size_t {
-        if (i < j) std::swap(i,j);
-        return (i*(i+1))/2 + j;
-    };
+  // Triangular compensation buffer
+  std::vector<double> comp(n*(n+1)/2, 0.0);
+  auto idxT = [&](size_t i, size_t j) -> size_t {
+    if (i < j) 
+      std::swap(i,j);
+    return (i*(i+1))/2 + j;
+  };
 
-    std::vector<double> row(n);
-    double logd = 0.0;
+  std::vector<double> row(n);
+  double logd = 0.0;
 
-    for (size_t k = 0; k < n; ++k) {
+  for (size_t k = 0; k < n; ++k) {
 
-        // ---- pivot search ----
-        double maxDiag = -1e300;
-        size_t p = k;
-        for (size_t i = k; i < n; ++i) {
-            double d = A(piv[i], piv[i]);
-            if (d > maxDiag) { maxDiag = d; p = i; }
-        }
-
-        if (maxDiag < eps_pivot) {
-            if (verbose) {
-                mprintf("PivotedChol: stop at k=%zu, maxDiag=% .6e\n", k, maxDiag);
-            }
-            return 2.0 * logd;
-        }
-
-        // ---- apply pivot ----
-        std::swap(piv[k], piv[p]);
-        const size_t pk = piv[k];
-
-        // ---- extract pivot ----
-        const double Akk = A(pk, pk);
-        if (!(Akk > 0.0)) {
-            if (verbose)
-                mprintf("PivotedChol: non-positive pivot at k=%zu: % .6e\n", k, Akk);
-            return 2.0 * logd;
-        }
-        const double Lkk = std::sqrt(Akk);
-        A(pk, pk) = Lkk;
-        logd += std::log(Lkk);
-
-        const double invLkk = 1.0 / Lkk;
-
-        // ---- build row ----
-        for (size_t j = k+1; j < n; ++j) {
-            size_t pj = piv[j];
-            row[j] = A(pk, pj) * invLkk;
-        }
-
-        // ---- Kahan‑compensated Schur update ----
-        for (size_t i = k+1; i < n; ++i) {
-            size_t pi = piv[i];
-            double ri = row[i];
-
-            for (size_t j = i; j < n; ++j) {
-                size_t pj = piv[j];
-                double rj = row[j];
-                double term = -(ri * rj);
-
-                double& aij = A(pi, pj);
-                double& cij = comp[idxT(pi,pj)];
-
-                double delta = term - cij;
-                double t = aij + delta;
-                cij = (t - aij) - delta;
-                aij = t;
-
-                A(pj, pi) = aij; // keep symmetry
-            }
-        }
-    }
-    if (verbose) {
-       mprintf("PivotedChol: completed at k=n=%zu, log det=% .6e\n", n, 2*logd);
+    // pivot search 
+    double maxDiag = -1e300;
+    size_t p = k;
+    for (size_t i = k; i < n; ++i) {
+      double d = A(piv[i], piv[i]);
+      if (d > maxDiag) { maxDiag = d; p = i; }
     }
 
-    return 2.0 * logd;
+    if (maxDiag < eps_pivot) {
+      if (verbose) {
+        mprintf("PivotedChol: stop at k=%zu, maxDiag=% .6e\n", k, maxDiag);
+      }
+      return 2.0 * logd;
+    }
+
+    // apply pivot 
+    std::swap(piv[k], piv[p]);
+    const size_t pk = piv[k];
+
+    // extract pivot 
+    const double Akk = A(pk, pk);
+    if (!(Akk > 0.0)) {
+      if (verbose)
+        mprintf("PivotedChol: non-positive pivot at k=%zu: % .6e\n", k, Akk);
+      return 2.0 * logd;
+    }
+    const double Lkk = std::sqrt(Akk);
+    A(pk, pk) = Lkk;
+    logd     += std::log(Lkk);
+
+    const double invLkk = 1.0 / Lkk;
+
+    // build row
+    for (size_t j = k+1; j < n; ++j) {
+      size_t pj = piv[j];
+      row[j] = A(pk, pj) * invLkk;
+    }
+
+    // Kahan‑compensated Schur update
+    for (size_t i = k+1; i < n; ++i) {
+      size_t pi = piv[i];
+      double ri = row[i];
+
+      for (size_t j = i; j < n; ++j) {
+        size_t pj = piv[j];
+        double rj = row[j];
+        double term = -(ri * rj);
+
+        double& aij = A(pi, pj);
+        double& cij = comp[idxT(pi,pj)];
+
+        double delta = term - cij;
+        double t = aij + delta;
+        cij = (t - aij) - delta;
+        aij = t;
+
+	A(pj, pi) = aij; // keep symmetry
+      }
+    }
+  }
+  if (verbose) {
+    mprintf("PivotedChol: completed at k=n=%zu, log det=% .6e\n", n, 2*logd);
+  }
+  return 2.0 * logd;
 }
 
 
+
 // --------------------------------------------------------------
-// Main exported function: automatic Gram/full switching
+// Main function: estimate entropy by doing everything except diagonalising a matrix.
 // --------------------------------------------------------------
 double Analysis_EntropyHD::Stable_Schlitter_LogDet(
         const double* Xc,   // centered & RB‑removed coordinates, (n×p)
@@ -1049,13 +1195,16 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     double      *xcmw, *xmean;  
     size_t       ptr_save;
 
+#ifdef DBG
+        HD_HEAP_POKE();
+#endif
+
     xcmw   = dalloc( p * n );
     xmean  = dalloc( p );
     if (xcmw == NULL || xmean == NULL ){
       mprinterr("failed to allocate memory for mass-weighted trajectory\n");
       return 0.;
     }
-
 
     //need to re-centre as the centroid of the sub-window will
     //different to that for the whole traj
@@ -1087,7 +1236,10 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
       read_ptr_ += 1;
       if ( read_ptr_ >= n ) read_ptr_ = 0;
     }
-    free( xmean );
+        
+#ifdef DBG
+        HD_HEAP_POKE();
+#endif
     //do not reset the buffer again.
 
     // --------------------------------------------
@@ -1095,6 +1247,8 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     // --------------------------------------------
     bool useGram = (n < (p - 6));
 
+
+    useGram = 0; //not sure Gram version will work with MI Schlitt 
     if (useGram) {
 
         // Form G = I + α/(n-1) * Xc Xc^T
@@ -1160,6 +1314,7 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
         C(i,j) = sum;
       }
     }
+    free( xcmw ); //free up some memory.
 
     // symmetrise and scale 
     double scaled_inv = alpha / double(n-1);
@@ -1179,27 +1334,532 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     }
 
 
+    //Find global entropy at the Schlitter level.
+    double eps_pivot = 1e-12; //TODO maybe ought to make this an argument. 
+    std::vector<size_t> all_dofs(p);
+    std::iota(all_dofs.begin(), all_dofs.end(), 0);
+    double S_schlitter_full = block_entropy_logdet(C, all_dofs, false);
+    all_dofs.clear();
+    mprintf( "global Schlitter Entropy S: %.6f\n", S_schlitter_full );
 
-  //  diag_report(C, "COV pre-factor");
+    //and start building a tree structure which owns the blocks.
+    ChowLiuTree CLtree;
+    double S_level = 0.0;
+    for (size_t a = 0; a < p; a += 3) {
+      double my_S;
+      my_S     = block_entropy_logdet(C, {a, a+1, a+2}, false, eps_pivot);
+      S_level += my_S;
+      CLtree.add_leaf_node( {a, a+1, a+2}, a / 3, my_S );
+    }
+    mprintf( "sum of per atom: %.6f\n", S_level );
 
-    free( xcmw );
+    double r_cut      = 8.0;
+    double w_min      = 0.05;
+    size_t node_counter = 0;    
+    size_t max_levels   = 8; //should terminate earlier, expect per moiety, per sidechain, per ss unit, per domain, per..
 
-    return greedy_pivoted_cholesky_logdet( C );
+    //keep a vector of CL tree nodes which can in theory be merged.
+    std::vector<TreeNode*> active;
+    active.reserve(CLtree.nodes().size());
+    for (auto& node : CLtree.nodes()) active.push_back(&node); //each starting node is "active"
+    MergeParams merge_params; //just init CL construction with defaults for now.
+
+    //build a list of edges (node pairs) which are actually targeted for merging.
+    std::vector<Edge> edges = build_weighted_contact_graph(active, xmean, p / 3, C, r_cut, w_min);
+    while( active.size() > 1 ) {
+
+      // Pairwise MI calculation is here./////////////////////////////
+      auto candidates = compute_mi_candidates_parallel(C, active, edges, merge_params);
+       
+      //define new nodes by merging those with largest pairwise MI.
+      //consumes candidate pairs (based on edges) and adds n/2 new nodes back to "active".
+      CLtree.greedy_merge_from_candidates( active, candidates );
+
+      //generate a new set of edges which can constrain (or not) the MI search in the next 
+      //iteration. For now, the search is only meaningfully constrained on iteration 0.
+      edges.clear();
+      for (size_t i = 0; i < active.size(); ++i) {
+        for (size_t j = i + 1; j < active.size(); ++j) {
+          edges.push_back(Edge{active[i], active[j]});
+        }
+      }
+   }
+   Cv.clear(); //C was a view onto Cv.
+   Cv.shrink_to_fit(); //substantial memory to free. 
+
+   CLtree.debug_print_tree();
+
+
+HD_HEAP_POKE(); 
+   //1D entropy correction: Shannon entropy of individual DOF  
+   double S_nonGauss1 = 0.0;
+   double S_nonGauss2 = 0.0;
+
+   mprintf("collecting entropy of CL tree with %zu nodes\n", CLtree.nodes().size());
+   for (size_t i_node = 0; i_node < CLtree.nodes().size(); i_node+=1 ) {
+     
+     TreeNode& node = CLtree.nodes()[i_node];
+
+     mprintf("##  %zu\n", i_node );
+     //check if leaf or higher.
+     if ( node.child1 == nullptr && node.child2 == nullptr ) {
+	//leaf node gets a Shannon entropy correction saved.
+        node.deltaH  = block_1d_negentropy_correction(Xc, n, p, node.dofs);
+        node.S_ng_1d = node.deltaH;
+        S_nonGauss1 += node.deltaH;
+
+        mprintf("leaf node %zu has Shannon entropy %.6f\n", node.id, node.deltaH);
+
+     } else {
+       //parent should have two well-defined childs.   
+       //get the difference between joint non-Gaussianness 
+       //and separate non-Gaussianness
+       double dS = sng2_merge_cca( 
+		       Xc, n, p, *(node.child1), *(node.child2), 0 );
+
+       //accumulate at the node
+       node.S_ng_2d = dS;
+       node.deltaH = node.child1->deltaH + node.child2->deltaH + dS;
+
+       mprintf("level X node %zu has moment entropy %.6f\n", node.id, node.S_ng_2d);
+
+     }
+   }
+HD_HEAP_POKE();
+
+
+
+
+   free( xmean );
+
+   return S_schlitter_full;
 }
 
 
 
+// Block negentropy correction:
+// the goal here is that having identified dominant degrees of freedom
+// or groups of degrees of freedom by the Chow-Liu MI estimate,
+// we can tighten the entropy by examining properties of the time
+// series beyond simple variance/covariance.
+double block_1d_negentropy_correction(
+    const double*              Xc,
+    size_t                     n_frames,
+    size_t                     p,
+    const std::vector<size_t>& block_dofs
+)
+{
+  const double log2pi_e = std::log(2.0 * M_PI * std::exp(1.0));
+  double negentropy_sum = 0.0;
+
+  const size_t k = block_dofs.size();
+
+#pragma omp parallel for reduction(+:negentropy_sum) schedule(static)
+  for (size_t idx = 0; idx < k; ++idx) {
+
+    const size_t dof = block_dofs[idx];
+
+    // Thread‑local buffer
+    std::vector<double> buffer(n_frames);
+
+    //load from shared memory: all threads to loop over frames in synch.
+    for (size_t f = 0; f < n_frames; ++f) buffer[f] = Xc[f * p + dof];
+
+    //mean and variance
+    double mean = 0.0;
+    for (double x : buffer) mean += x;
+    mean /= n_frames;
+    double var = 0.0;
+    for (double x : buffer) {
+      double d = x - mean;
+      var += d * d;
+    }
+    var /= n_frames;
+
+    //can have some numerical instability e.g. for a constrained degree of freedom
+    if (var <= 0.0) continue;
+
+    //calculate a 1D correction J for each DOF, 
+    //using a nonparametric histogram 
+    const double S_gauss = 0.5 * (log2pi_e + std::log(var));
+    const double S_emp   = histogram_entropy_1d(buffer.data(), n_frames, mean, var);
+    const double J       = S_gauss - S_emp;
+
+    //accumulate into a shared memory variable.
+    if (J > 0.0) negentropy_sum += J;
+ }
+ return negentropy_sum;
+}
+
+// Estimate 1D differential entropy using an adaptive/non-parametric histogram
+// based on the Freedman–Diaconis rule.
+// Input data is assumed centered.
+//
+// Error behaviour: converges from above as something like n**(2/3)
+// ...could implement a bootstrap error estimation, probably better to do this at top 
+// level.
+double histogram_entropy_1d(const double* x, size_t n, double mean, double var ) {
+
+  //sanitise.
+  if ( n <= 1 )    { return 0.; } //shouldn't happen, but might as well have a check.
+  if ( var <= 0.0 ){ return 0.; } //this problem case *is* possible: non-physical restrained degree of freedom.
+
+  // Copy and then sort data
+  std::vector<double> v(x, x + n);
+  std::sort(v.begin(), v.end());
+
+  // Compute interquartile range for adaptive bin width
+  const size_t q25_idx = static_cast<size_t>(0.25 * n);
+  const size_t q75_idx = static_cast<size_t>(0.75 * n);
+  const double q25 = v[q25_idx];
+  const double q75 = v[q75_idx];
+  const double iqr = q75 - q25;
+
+  // Freedman–Diaconis bin width
+  double h;
+  double sigma = std::sqrt(var);
+  if (iqr > 0.0)  h = 2.0 * iqr   / std::cbrt(static_cast<double>(n));
+  else            h = 3.5 * sigma / std::cbrt(static_cast<double>(n));
+  if (h <= 0.0)   return 0.0;
+
+  // Domain
+  const double xmin = v.front();
+  const double xmax = v.back();
+
+  size_t nbin = static_cast<size_t>((xmax - xmin) / h) + 1;
+  if (nbin < 1) nbin = 1;
+
+  // Histogram
+  std::vector<size_t> hist(nbin, 0);
+  for (double xi : v) {
+    size_t b = static_cast<size_t>((xi - xmin) / h);
+    if (b >= nbin)
+      b = nbin - 1;
+    hist[b]++;
+  }
+
+  // Shannon entropy of the histogram
+  double S = 0.0;
+  for (size_t c : hist) {
+    if (c == 0) continue;
+    double p = static_cast<double>(c) / n;
+    S -= p * std::log(p);
+  }
+
+  // Compensate for bin width to approximate differential entropy.
+  S += std::log(h);
+
+  return S;
+}
+
+// Tree-guided 2D moment (cross-kurtosis) correction.
+// Returns a NON-NEGATIVE entropy correction to SUBTRACT.
+double block_2d_moments_correction(
+  const double*                          Xc,           // n_frames × p
+  size_t                                 n_frames,
+  size_t                                 p,
+  const TreeNode*                        u,
+  const TreeNode*                        v ){
+
+ 
+  constexpr double eps  = 1e-14;
+  double correction     = 0.; //accumulator 
+
+  //loop over individual pairs of dofs within the
+  //link between blocks
+  for (size_t iu = 0; iu < u->dofs.size(); ++iu) {
+    const size_t i = u->dofs[iu];
+    for (size_t iv = 0; iv < v->dofs.size(); ++iv) {
+      const size_t j = v->dofs[iv];
+
+      double m_xx    = 0.0;
+      double m_yy    = 0.0;
+      double m_xy    = 0.0;
+      double m_xx_yy = 0.0;
+
+      //loop over frames
+      for (size_t f = 0; f < n_frames; ++f) {
+        const double xi  = Xc[f * p + i];
+        const double xj  = Xc[f * p + j];
+        const double xi2 = xi * xi;
+        const double xj2 = xj * xj;
+
+        m_xx    += xi2;
+        m_yy    += xj2;
+        m_xy    += xi * xj;
+        m_xx_yy += xi2 * xj2;
+      }
+
+      const double inv_n = 1.0 / static_cast<double>(n_frames);
+      m_xx    *= inv_n;
+      m_yy    *= inv_n;
+      m_xy    *= inv_n;
+      m_xx_yy *= inv_n;
+
+      // Connected 4th-order cumulant kappa_{2,2}
+      double k22 =
+           m_xx_yy
+         - m_xx * m_yy
+         - 2.0 * m_xy * m_xy;
+
+      const double denom = m_xx * m_yy;
+      if (denom <= eps) continue;
+
+      // Dimensionless normalized cumulant
+      double k22_norm = k22 / denom;
+
+      // If noise-dominated or Gaussian, ignore
+      if (k22_norm <= 0.0) continue;
+
+      // Leading Edgeworth entropy correction
+      double deltaS = k22_norm / 48.0;
+
+      // Conservative clipping (finite-sample protection)
+      constexpr double max_pair_contribution = 0.1;
+      if (deltaS > max_pair_contribution) deltaS = max_pair_contribution;
+
+      //sum out to the named reduction variable identified at the top of
+      //the loop
+      correction += deltaS;
+    }
+  }
+  return correction;
+}
 
 
+//////////////////////////////////////////////////////////////
+// Central kernel of this approach:
+// Computes NEW non-Gaussian entropy corrections introduced by merging blocks A and B
+// Assumes:
+//   - internal H(A), H(B) already harvested, so individual blocks are now multivariate Gaussians.
+//   - A.dofs and B.dofs are disjoint
+// Returns:
+//   - An entropy correction Sng_merge >= 0.
+//
+// Why are we doing this? Because Schlitter entropy is a good bound for systems which are
+// Gaussian. To tighten the bound, we look at deviations from Gaussian.
+//
+// 1-dof deviations can come from a 1D Shannon entropy, but N-dimensional Shannon is hard.
+//
+// We find the N-body deviations in NlogN merges going up a tree
+// constructed heuristically to harvest the most information at the lowest levels.
+//
+/////
+double sng2_merge_cca(
+  const double* Xc,
+  size_t n_frames,
+  size_t p,
+  const  TreeNode& A,
+  const  TreeNode& B,
+  size_t max_modes,
+  double eps
+) {
+  const size_t   m = A.dofs.size();
+  const size_t   n = B.dofs.size();
+  const size_t* Ad = A.dofs.data();
+  const size_t* Bd = B.dofs.data();
+  if (m == 0 || n == 0)
+    return 0.0;
+  
+  //cpptraj linear algebra API
+  //could have lapack or similar under it, depends on compilation.
+  DataSet_MatrixDbl Cwh;
+  DataSet_Modes     modesA, modesB, modesCCA;
+  DataSet_MatrixDbl SigmaAB;
+  DataSet_MatrixDbl WA, WB;
 
+  { //declare a scope to find block second moments.
+    DataSet_MatrixDbl SigmaA, SigmaB;
+    SigmaA.AllocateHalf(m);
+    SigmaB.AllocateHalf(n);
+    SigmaAB.Allocate2D(n, m);
 
+    //build local sub-block matrices.
+    for (size_t f = 0; f < n_frames; ++f) {
+      const size_t fp = f * p;
+      // SigmaA
+      for (size_t i = 0; i < m; ++i) {
+        const double xi = Xc[fp + Ad[i]];
+        for (size_t j = 0; j <= i; ++j)
+          SigmaA.UpdateElement(i, j, xi * Xc[fp + Ad[j]]);
+      }
 
+      // SigmaB
+      for (size_t i = 0; i < n; ++i) {
+        const double xi = Xc[fp + Bd[i]];
+        for (size_t j = 0; j <= i; ++j)
+          SigmaB.UpdateElement(i, j, xi * Xc[fp + Bd[j]]);
+      }
 
+      // SigmaAB
+      for (size_t i = 0; i < m; ++i) {
+        const double xi = Xc[fp + Ad[i]];
+        for (size_t j = 0; j < n; ++j)
+          SigmaAB.UpdateElement(j, i, xi * Xc[fp + Bd[j]]);
+      }
+    }  
+    const double invN = 1.0 / double(n_frames);
+    SigmaA.Normalize(invN);
+    SigmaB.Normalize(invN);
+    SigmaAB.Normalize(invN);
 
+    /* Full eigensystems required for block whitening */
+    modesA.CalcEigen_General(SigmaA);
+    modesB.CalcEigen_General(SigmaB);
+  }
 
+  { //open another scope for whitening
+    DataSet_MatrixDbl WA, WB;
+    WA.Allocate2D(m, m);
+    WB.Allocate2D(n, n);
+    for (size_t i = 0; i < m; i++) {
+      double eval      = std::max(modesA.Eigenvalue(i), eps);
+      double scale     = 1.0 / std::sqrt(eval);
+      const double* ei = modesA.Eigenvector(i);
+      for (size_t j = 0; j < m; j++) WA.SetElement(i, j, scale*ei[j]);
+    }
+    for (size_t i = 0; i < n; i++) {
+      double eval = std::max(modesB.Eigenvalue(i), eps);
+      double scale = 1.0 / std::sqrt(eval);
+      const double* ei = modesB.Eigenvector(i);
+      for (size_t j = 0; j < n; j++) WB.SetElement(i, j, scale*ei[j]);
+    }
 
+    /* subscope whitened cross-covariance C = WA * SigmaAB * WB^T */
+    {
+      DataSet_MatrixDbl tmp;
+      tmp.Multiply(WA, SigmaAB);
+      Cwh.Multiply_M2transpose(tmp, WB);
+    }
+  }
 
+  { //open another scope for M
+    DataSet_MatrixDbl M;
 
+    /* Symmetric CCA matrix M = C * C^T */
+    M.AllocateHalf(m);
+    M.Clear();
+    for (size_t i = 0; i < m; i++)
+      for (size_t j = 0; j <= i; j++)
+        for (size_t k = 0; k < n; k++)
+          M.UpdateElement(i, j,
+            Cwh.GetElement(k, i) * Cwh.GetElement(k, j));
 
+    /* Canonical correlations from M */
+    if (max_modes > 0)
+      modesCCA.CalcEigen(M, max_modes);
+    else
+      modesCCA.CalcEigen_General(M);
+  }
+  const size_t k = modesCCA.Size();
+  if (k == 0)
+    return 0.0;
 
+  /* Residual non-Gaussian invariant */
+  double mean_r4 = 0.0;
+  for (size_t f = 0; f < n_frames; f++) {
+    double r2A = 0.0;
+    double r2B = 0.0;
 
+    for (size_t i = 0; i < m; i++) {
+      double z = 0.0;
+      for (size_t j = 0; j < m; j++)
+        z += WA.GetElement(i, j) * Xc[f * p + A.dofs[j]];
+      r2A += z * z;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+      double z = 0.0;
+      for (size_t j = 0; j < n; j++)
+        z += WB.GetElement(i, j) * Xc[f * p + B.dofs[j]];
+      r2B += z * z;
+    }
+
+    mean_r4 += r2A * r2B;
+  }
+
+  mean_r4 /= double(n_frames);
+
+  double rho2sum = 0.0;
+  for (size_t i = 0; i < k; i++)
+    rho2sum += modesCCA.Eigenvalue(i);
+
+  double kappa = mean_r4 - (k + 2.0 * rho2sum);
+  if (kappa <= 0.0)
+    return 0.0;
+
+  return kappa / 48.0;
+}
+
+//search over an edge list to find the most
+//promising blocks to merge, and sort
+//by score descending.
+std::vector<Edge>
+compute_mi_candidates_parallel(
+  const MatrixView&              Cfull,
+  const std::vector<TreeNode*>&  active,
+  const std::vector<Edge>&       edges,
+  const MergeParams&             params
+)
+{
+  const int nthreads = omp_get_max_threads();
+  std::vector<std::vector<Edge>> tls(nthreads);
+
+  #pragma omp parallel
+  {
+    const int tid = omp_get_thread_num();
+    auto& local = tls[tid];
+
+    #pragma omp for schedule(dynamic, 32)
+    for (size_t e = 0; e < edges.size(); ++e) {
+
+      const Edge& edge = edges[e];
+      const TreeNode* A = edge.a;
+      const TreeNode* B = edge.b;
+
+      // Defensive: should not happen, but cheap
+      if (!A || !B) continue;
+
+      // Mutual information for two blocks
+      double mi = mutual_information_logdet(
+        Cfull,
+        A->dofs,
+        B->dofs,
+        /*verbose=*/false,
+        params.eps_pivot
+      );
+
+      if (mi <= params.min_mi_gain)
+        continue;
+
+      local.emplace_back(A, B, mi);
+    }
+  }
+
+  // Combine thread-local vectors
+  size_t total = 0;
+  for (const auto& v : tls)
+    total += v.size();
+
+  std::vector<Edge> candidates;
+  candidates.reserve(total);
+
+  for (auto& v : tls) {
+    candidates.insert(
+      candidates.end(),
+      std::make_move_iterator(v.begin()),
+      std::make_move_iterator(v.end())
+    );
+  }
+
+  // Sort by descending MI (Chow–Liu greedy order)
+  std::sort(
+    candidates.begin(),
+    candidates.end(),
+    [](const Edge& x, const Edge& y) {
+      return x.weight > y.weight;
+    }
+  );
+
+  return candidates;
+}
