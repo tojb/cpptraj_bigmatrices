@@ -97,6 +97,7 @@
 //utility files used only/mainly by the entropy code
 #include "ThermoUtils.h"
 #include "ChowLiuTree_Entropy.h"
+#include "Entropy_polyGauss.h"
 
 //this is a convenient debug macro to test heap integrity.
 #define DBG
@@ -1403,17 +1404,35 @@ HD_HEAP_POKE();
      mprintf("##  %zu\n", i_node );
      //check if leaf or higher.
      if ( node.child1 == nullptr && node.child2 == nullptr ) {
-	//leaf node gets a Shannon entropy correction saved.
-        node.deltaH  = block_1d_negentropy_correction(Xc, n, p, node.dofs);
+        size_t d = node.dofs.size(); //should be 3, but stay flexible
+
+	//leaf node (3 DOF) gets a nice polynomial-Gaussian entropy correction.
+	std::vector<double> X_block( n * node.dofs.size() );	
+        for (size_t f = 0; f < n; f++) 
+          for (size_t a = 0; a < d; a++) 
+            X_block[f*d + a] = Xc[f*p + node.dofs[a]];
+
+        
+        PolyGaussModel pg;
+        bool ok = fit_polyGauss_block( X_block.data(), n, d, pg );
+        if (ok) {
+          // Gaussian entropy already accounted for by Schlitter;
+          // PolyGauss returns a *correction* relative to Gaussian
+          node.deltaH  = -pg.entropy_correction;
+        } else {
+          // Fallback: no correction if PG fit fails
+          node.deltaH = 0.0;
+        }
         node.S_ng_1d = node.deltaH;
         S_nonGauss1 += node.deltaH;
 
-        mprintf("leaf node %zu has Shannon entropy %.6f\n", node.id, node.deltaH);
+        mprintf("leaf node %zu has non-Gaussian negentropy %.6f\n", node.id, node.deltaH);
 
      } else {
        //parent should have two well-defined childs.   
        //get the difference between joint non-Gaussianness 
        //and separate non-Gaussianness
+
        double dS = sng2_merge_cca( 
 		       Xc, n, p, *(node.child1), *(node.child2), 0 );
 
@@ -1660,13 +1679,12 @@ double sng2_merge_cca(
   const size_t* Bd = B.dofs.data();
   if (m == 0 || n == 0)
     return 0.0;
-  
+
   //cpptraj linear algebra API
   //could have lapack or similar under it, depends on compilation.
   DataSet_MatrixDbl Cwh;
   DataSet_Modes     modesA, modesB, modesCCA;
   DataSet_MatrixDbl SigmaAB;
-  DataSet_MatrixDbl WA, WB;
 
   { //declare a scope to find block second moments.
     DataSet_MatrixDbl SigmaA, SigmaB;
@@ -1708,8 +1726,8 @@ double sng2_merge_cca(
     modesB.CalcEigen_General(SigmaB);
   }
 
+  DataSet_MatrixDbl WA, WB; //need these later.
   { //open another scope for whitening
-    DataSet_MatrixDbl WA, WB;
     WA.Allocate2D(m, m);
     WB.Allocate2D(n, n);
     for (size_t i = 0; i < m; i++) {
@@ -1738,7 +1756,6 @@ double sng2_merge_cca(
 
     /* Symmetric CCA matrix M = C * C^T */
     M.AllocateHalf(m);
-    M.Clear();
     for (size_t i = 0; i < m; i++)
       for (size_t j = 0; j <= i; j++)
         for (size_t k = 0; k < n; k++)
@@ -1746,10 +1763,8 @@ double sng2_merge_cca(
             Cwh.GetElement(k, i) * Cwh.GetElement(k, j));
 
     /* Canonical correlations from M */
-    if (max_modes > 0)
-      modesCCA.CalcEigen(M, max_modes);
-    else
-      modesCCA.CalcEigen_General(M);
+    if (max_modes == 0) max_modes = m;
+    modesCCA.CalcEigen(M, max_modes);
   }
   const size_t k = modesCCA.Size();
   if (k == 0)
@@ -1777,7 +1792,6 @@ double sng2_merge_cca(
 
     mean_r4 += r2A * r2B;
   }
-
   mean_r4 /= double(n_frames);
 
   double rho2sum = 0.0;
