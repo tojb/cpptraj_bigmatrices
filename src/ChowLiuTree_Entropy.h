@@ -24,6 +24,7 @@ struct MatrixView {
 struct TreeNode;
 typedef struct TreeNode {
     int       id;
+    int       tree_level;
     short int state_flag; //use this for whatever.
 
     // structural pointers

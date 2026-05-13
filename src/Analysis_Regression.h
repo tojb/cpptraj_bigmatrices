@@ -390,6 +390,7 @@ bool LM_Optimize(const RegressionModelBase& model,
 class Analysis_Regression : public Analysis {
 public:
   Analysis_Regression();
+ ~Analysis_Regression() override { delete model_; model_ = nullptr; };
   virtual void Help() const;
   virtual RetType Setup(ArgList&, AnalysisSetup&, int);
   virtual RetType Analyze();

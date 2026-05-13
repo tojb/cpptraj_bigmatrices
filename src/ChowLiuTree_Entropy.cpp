@@ -45,14 +45,15 @@ TreeNode* ChowLiuTree::add_leaf_node(const std::vector<size_t>& dofs, size_t id,
 
   n->id = id;
 
-  //init with no connections
+  //init with no connections: "orphan leaf"
   n->parent = nullptr;
   n->child1 = nullptr;
   n->child2 = nullptr;
+  n->tree_level = 0;
 
   //save what degrees of freedom (matrix rows) it controls
   n->dofs = dofs;
-
+   
   //a million definitions of entropy.
   n->S_ng_1d = 0.0;
   n->S_ng_2d = 0.0;
@@ -74,6 +75,12 @@ TreeNode* ChowLiuTree::merge(TreeNode* a, TreeNode* b) {
   p->child1 = a;
   p->child2 = b;
   p->id     = nodes_.size();
+
+  //make sure the next level is one up from previous.
+  p->tree_level = a->tree_level + 1;
+  if ( p->tree_level < b->tree_level + 1) {
+    p->tree_level = b->tree_level + 1;
+  }
 
   a->parent = p;
   b->parent = p;
@@ -235,6 +242,8 @@ void ChowLiuTree::greedy_merge_from_candidates(
   for (const auto& c : candidates) {
     auto* a = const_cast<TreeNode*>(c.a); //these pointers are constants until they aren't
     auto* b = const_cast<TreeNode*>(c.b);
+
+
     if ( a->state_flag != 0 || b->state_flag != 0 ) {
       continue;
     }
@@ -252,7 +261,6 @@ void ChowLiuTree::greedy_merge_from_candidates(
       next_active.push_back(node);
     }
   }
-
   active.swap(next_active);
 }
 

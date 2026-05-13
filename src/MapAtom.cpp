@@ -55,9 +55,21 @@ MapAtom::MapAtom(const Atom& rhs, const double* xyzIn) : Atom(rhs),
   isMapped_(false),
   complete_(false),
   Nduplicated_(0),
-  name_(AtomicElementChar_[Element()])
+  name_('?') //default to Idontknowmium
 {
-  std::copy( xyzIn, xyzIn + 3, xyz_ );
+  // Safely assign element, cpptraj doesn't go up to Unobtanium
+  const int e = static_cast<int>(Element());
+  if (e >= 0 && e < static_cast<int>(Atom::NUMELEMENTS_))
+    name_ = AtomicElementChar_[e];
+  else
+    name_ = '?'; // overwrite "?" with "?" just to make the point.
+
+  // Coordinate safety, while we're here.
+  if (xyzIn != nullptr)
+    std::copy(xyzIn, xyzIn + 3, xyz_);
+  else {
+    xyz_[0] = xyz_[1] = xyz_[2] = 0.0; //
+  }
 }
 
 // Assignment

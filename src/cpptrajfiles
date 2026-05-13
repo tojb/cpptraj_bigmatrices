@@ -262,6 +262,7 @@ COMMON_SOURCES= \
         EnsembleOut_Single.cpp \
         EnsembleOutList.cpp \
         Entropy_polyGauss.cpp \
+        Entropy_Moments.cpp \
         EwaldOptions.cpp \
         ExclusionArray.cpp \
         Exec_AddMissingRes.cpp \

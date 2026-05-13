@@ -98,10 +98,11 @@
 #include "ThermoUtils.h"
 #include "ChowLiuTree_Entropy.h"
 #include "Entropy_polyGauss.h"
+#include "Entropy_Moments.h"
 
 //this is a convenient debug macro to test heap integrity.
-#define DBG
-#ifdef __DBG
+#define __DBG
+#ifdef DBG
 #define HD_HEAP_POKE(); do { \
   void* _p = malloc(16); \
   if (!_p) abort(); \
@@ -114,6 +115,8 @@
 #define HD_HEAP_POKE(); ;
 #endif
 
+
+#define SANITIZE_INPUT_COORDS
 
 //local function(s) not exposed:
 //
@@ -129,33 +132,6 @@ compute_mi_candidates_parallel(const MatrixView&              C,
                                const std::vector<TreeNode*>&  active,//search these nodes.
                                const std::vector<Edge>&       edges, //search these edges.
                                const MergeParams&             P);
-
-//////////////////////////////////////////////////////////////
-// Central kernel of this approach:
-// Computes NEW non-Gaussian entropy corrections introduced by merging blocks A and B
-// Assumes:
-//   - internal H(A), H(B) already harvested, so individual blocks are now multivariate Gaussians.
-//   - A.dofs and B.dofs are disjoint
-// Returns:
-//   - An entropy correction Sng_merge >= 0.
-//
-// Why are we doing this? Because Schlitter entropy is a good bound for systems which are 
-// Gaussian. To tighten the bound, we look at deviations from Gaussian.
-//
-// 1-dof deviations can come from a 1D Shannon entropy, but N-dimensional Shannon is hard. 
-//
-// We find the N-body deviations in NlogN merges going up a tree
-// constructed heuristically to harvest the most information at the lowest levels.
-//
-/////   
-double sng2_merge_cca(
-  const double*             Xc,        // centered data (n_frames × p)
-  size_t                    n_frames,
-  size_t                    p,
-  const TreeNode&           A,
-  const TreeNode&           B,
-  size_t                    max_modes  = 3, // truncate CCA (practical)
-  double                    eps        = 1e-8);
 
 
 
@@ -635,12 +611,14 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
     mprinterr("entropy_hd: Failed to allocate memory for coordinate matrix.\n");
     return Analysis::ERR;
   } else {
-    mprintf("dalloc'd. Aligning coordinates:\n");
+    mprintf("alloc'd. Aligning coordinates:\n");
   }
 
   //this saves the average coordinates to AverageFrame_
   BuildAlignedCoordinates(Coords_, mask_, X);
   mprintf("Aligned.\n");
+
+
 
   //for convenience, the AverageFrame has unit mass atoms
   //because all the averaging is geometric, but we set them
@@ -682,6 +660,7 @@ Analysis::RetType Analysis_EntropyHD::Analyze() {
 
     size_t n = (i + 1) * window_;
     double ld;
+
     ld = Stable_Schlitter_LogDet( X, n, P_, massVec.data() );
     if ( do_jacobi_ ) {
       mprintf(" log determinant by Cholesky: %f\n", ld);
@@ -752,10 +731,33 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
     ref.SetupFrameFromMask(mask_);
     fr.SetupFrameFromMask(mask_);
 
+    //having masked-down the frame objects already, 
+    //create a dummy mask that says "all remaining atoms".
+    AtomMask dummyMask(0, nSel);
+
+    //sanity check this crazy mask stuff honestly masking should be at input, not now.
+    int maxIdx = -1;
+    int nMask = 0;
+    for (AtomMask::const_iterator it = dummyMask.begin(); it != dummyMask.end(); ++it) {
+      if (*it > maxIdx) maxIdx = *it;
+      nMask++;
+    }
+    mprintf("fr.Natom=%d dummyMask.Nselected=%d dummyMask.maxIdx=%d\n",
+					 fr.Natom(), nMask, maxIdx);
+
+
     // -----------------------------------------------------------
     // First pass: align to frame 0 and accumulate Cartesian average
     // -----------------------------------------------------------
     Coords_->GetFrame(0, ref, mask_);
+
+ #ifdef SANITIZE_INPUT_COORDS
+  mprintf("setting reference frame out of %zu at input\n", nFrames);
+  for (size_t j = 0; j < nSel; j++) {
+    mprintf("at %zu of %i %.3f %.3f %.3f\n", j, nSel, ref.XYZ(j)[0],  ref.XYZ(j)[1], ref.XYZ(j)[2] );
+  }
+#endif
+
 
 try {
     AvgXYZ_.resize(p, 0.); 
@@ -764,21 +766,40 @@ try {
     exit( 1 );
 }
     for (int f = 0; f < nFrames; f++) {
-        Coords_->GetFrame(f, fr, mask_);
+      Coords_->GetFrame(f, fr, mask_);
 
-        fr.Align(ref, mask_);   
+      //sanity-check masking.
+      int maxIdx = -1;
+      for (AtomMask::const_iterator it = dummyMask.begin(); it != dummyMask.end(); ++it)
+      if (*it > maxIdx) maxIdx = *it;
+      if ( fr.Natom() <  maxIdx ){
+	 mprinterr("ERROR: fr.Natom=%d mask.Nselected=%d mask.maxIdx=%d\n", fr.Natom(), dummyMask.Nselected(), maxIdx);
+      }
 
-        for (int si = 0; si < nSel; si++) {
+      //already masked
+      fr.Align(ref, dummyMask);   
+
+      for (int si = 0; si < nSel; si++) {
             const double* xyz = fr.XYZ(si);
             AvgXYZ_[3*si + 0] += xyz[0];
             AvgXYZ_[3*si + 1] += xyz[1];
             AvgXYZ_[3*si + 2] += xyz[2];
         }
     }
-
-
     const double invN = 1.0 / double(nFrames);
     for (int j = 0; j < p; j++) AvgXYZ_[j] *= invN;
+
+ #ifdef SANITIZE_INPUT_COORDS
+  mprintf("average frame out of %zu at input\n", nFrames);
+  for (size_t j = 0; j < p; j++) {
+    mprintf("%.3f ", AvgXYZ_[j] );
+    if ( j == 10 ){
+       mprintf("\n");
+       break;
+    } 
+  }
+#endif
+
 
     // -----------------------------------------------------------
     // Build average frame as a "Frame" object from first-pass mean
@@ -814,10 +835,10 @@ try {
 //marking the GetFrame as critical because I'm not sure if it mutates state inside the coords reader.
 #pragma omp critical
 		{
-            Coords_->GetFrame(f, local, mask_);
+            Coords_->GetFrame(f, local, dummyMask);
 		}
 
-            local.Align(AverageFrame_, mask_); //because we copied the average coordinates into the Frame object, 
+            local.Align(AverageFrame_, dummyMask); //because we copied the average coordinates into the Frame object, 
 	                               //we can use API functions like Align()
 
             // ---------- Translation removal:  COM ----------
@@ -921,6 +942,31 @@ try {
             for (int j = 0; j < p; j++) row[j] = y[j];
         }
     }
+
+#ifdef SANITIZE_INPUT_COORDS
+  double max_abs_mean = 0.0;
+  size_t argmax = 0;
+  for (size_t j = 0; j < p; j++) {
+    double mu = 0.0;
+    for (size_t f = 0; f < nFrames; f++)
+      mu += X[f * p + j];
+    mu /= double(nFrames);
+    const double a = std::abs(mu);
+    if (a > max_abs_mean) { max_abs_mean = a; argmax = j; }
+  }
+  mprintf("X centering check at write: max_abs_mean=%g at dof=%zu\n", max_abs_mean, argmax);
+  mprintf("frame 1 now looks like: \n");
+  for (size_t j = 0; j < p; j++) {
+    mprintf("%.3f ", X[p+j] );
+    if ( j == 10 ){
+       mprintf("\n");
+       break;
+    }
+  }
+#endif
+
+
+
 
     // -----------------------------------------------------------
     // SECOND-PASS MEAN and CENTERING
@@ -1125,7 +1171,7 @@ static double greedy_pivoted_cholesky_logdet(
 
     if (maxDiag < eps_pivot) {
       if (verbose) {
-        mprintf("PivotedChol: stop at k=%zu, maxDiag=% .6e\n", k, maxDiag);
+        mprintf("PivotedChol: stop at k=%zu, maxDiag=% .6e, logd: %e\n", k, maxDiag, logd);
       }
       return 2.0 * logd;
     }
@@ -1138,7 +1184,7 @@ static double greedy_pivoted_cholesky_logdet(
     const double Akk = A(pk, pk);
     if (!(Akk > 0.0)) {
       if (verbose)
-        mprintf("PivotedChol: non-positive pivot at k=%zu: % .6e\n", k, Akk);
+        mprintf("PivotedChol: non-positive pivot at k=%zu: % .6e .. %e\n", k, Akk, logd);
       return 2.0 * logd;
     }
     const double Lkk = std::sqrt(Akk);
@@ -1196,16 +1242,31 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     double      *xcmw, *xmean;  
     size_t       ptr_save;
 
-#ifdef DBG
-        HD_HEAP_POKE();
-#endif
-
     xcmw   = dalloc( p * n );
     xmean  = dalloc( p );
     if (xcmw == NULL || xmean == NULL ){
       mprinterr("failed to allocate memory for mass-weighted trajectory\n");
       return 0.;
     }
+
+ #ifdef SANITIZE_INPUT_COORDS
+  double max_abs_mean = 0.0;
+  size_t argmax = 0;
+  for (size_t j = 0; j < p; j++) {
+    double mu = 0.0;
+    for (size_t f = 0; f < n; f++){
+      mu += Xc[f * p + j];
+    }
+    mu /= double(n);
+    const double a = std::abs(mu);
+    if (a > max_abs_mean) { max_abs_mean = a; argmax = j; }
+  }
+  mprintf("Xc centering check at input to Stable Schlitter: max_abs_mean=%g at dof=%zu\n", max_abs_mean, argmax);
+  for (size_t j = 0; j < p; j++){
+    mprintf("frame 0 dof %zu : %.2f\n", j, Xc[ j ] );
+    if ( j > 10 ) break;
+  }
+#endif
 
     //need to re-centre as the centroid of the sub-window will
     //different to that for the whole traj
@@ -1238,9 +1299,6 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
       if ( read_ptr_ >= n ) read_ptr_ = 0;
     }
         
-#ifdef DBG
-        HD_HEAP_POKE();
-#endif
     //do not reset the buffer again.
 
     // --------------------------------------------
@@ -1296,7 +1354,8 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     // ---------------------------------------------------------
     // FULL COV MATRIX path: p×p
     // ---------------------------------------------------------
- //   mprintf("Stable Schlitter: guessing we have enough frames for a stable covariance matrix: (%zu×%zu)\n", p, p);
+    mprintf("Stable Schlitter: guessing we have enough frames for a stable covariance matrix: (%zu×%zu)\n", p, p);
+    fflush(stderr);
 
     std::vector<double> Cv(p*p, 0.0);
     MatrixView C{Cv.data(), p};
@@ -1335,6 +1394,7 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     }
 
 
+
     //Find global entropy at the Schlitter level.
     double eps_pivot = 1e-12; //TODO maybe ought to make this an argument. 
     std::vector<size_t> all_dofs(p);
@@ -1342,6 +1402,7 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     double S_schlitter_full = block_entropy_logdet(C, all_dofs, false);
     all_dofs.clear();
     mprintf( "global Schlitter Entropy S: %.6f\n", S_schlitter_full );
+    fflush(stdout);
 
     //and start building a tree structure which owns the blocks.
     ChowLiuTree CLtree;
@@ -1356,8 +1417,6 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
 
     double r_cut      = 8.0;
     double w_min      = 0.05;
-    size_t node_counter = 0;    
-    size_t max_levels   = 8; //should terminate earlier, expect per moiety, per sidechain, per ss unit, per domain, per..
 
     //keep a vector of CL tree nodes which can in theory be merged.
     std::vector<TreeNode*> active;
@@ -1367,6 +1426,8 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
 
     //build a list of edges (node pairs) which are actually targeted for merging.
     std::vector<Edge> edges = build_weighted_contact_graph(active, xmean, p / 3, C, r_cut, w_min);
+
+    int iter_count = 0;
     while( active.size() > 1 ) {
 
       // Pairwise MI calculation is here./////////////////////////////
@@ -1384,26 +1445,54 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
           edges.push_back(Edge{active[i], active[j]});
         }
       }
+
+      //just a quick check for infinite loops.
+      iter_count += 1;
+      if ( iter_count > p*3 ){
+        mprinterr("Oooops infinite loop building CL tree at %i iterations\n", iter_count );
+	break;
+      }
    }
    Cv.clear(); //C was a view onto Cv.
    Cv.shrink_to_fit(); //substantial memory to free. 
 
    CLtree.debug_print_tree();
 
-
-HD_HEAP_POKE(); 
    //1D entropy correction: Shannon entropy of individual DOF  
    double S_nonGauss1 = 0.0;
    double S_nonGauss2 = 0.0;
 
+ #ifdef _SANITIZE_INPUT_COORDS
+  double max_abs_mean = 0.0;
+  size_t argmax = 0;
+  for (size_t j = 0; j < p; j++) {
+    double mu = 0.0;
+    for (size_t f = 0; f < n_frames; f++)
+      mu += Xc[f * p + j];
+    mu /= double(n_frames);
+    const double a = std::abs(mu);
+    if (a > max_abs_mean) { max_abs_mean = a; argmax = j; }
+  }
+  mprintf("Xc centering check: max_abs_mean=%g at dof=%zu\n", max_abs_mean, argmax);
+#endif
+
+
    mprintf("collecting entropy of CL tree with %zu nodes\n", CLtree.nodes().size());
    for (size_t i_node = 0; i_node < CLtree.nodes().size(); i_node+=1 ) {
-     
      TreeNode& node = CLtree.nodes()[i_node];
 
-     mprintf("##  %zu\n", i_node );
-     //check if leaf or higher.
-     if ( node.child1 == nullptr && node.child2 == nullptr ) {
+    
+    if ( node.tree_level <= 2 ) {
+      const std::vector<size_t>& block_dofs = node.dofs; 
+      double S_shannon = block_1d_negentropy_correction( Xc, n,   block_dofs.size(),  block_dofs );
+
+      mprintf("node %i:%zu Shannon negentropy J = %.6e\n", node.tree_level, node.id, S_shannon );
+    }
+
+
+
+     //efficiency: only get polyGauss at first two tree levels.
+     if ( node.tree_level <= 3 ) {
         size_t d = node.dofs.size(); //should be 3, but stay flexible
 
 	//leaf node (3 DOF) gets a nice polynomial-Gaussian entropy correction.
@@ -1418,7 +1507,8 @@ HD_HEAP_POKE();
         if (ok) {
           // Gaussian entropy already accounted for by Schlitter;
           // PolyGauss returns a *correction* relative to Gaussian
-          node.deltaH  = -pg.entropy_correction;
+          // formally this should always be negative, if it isn't that is a numerical problem.
+	  node.deltaH  = -pg.entropy_correction;
         } else {
           // Fallback: no correction if PG fit fails
           node.deltaH = 0.0;
@@ -1426,9 +1516,14 @@ HD_HEAP_POKE();
         node.S_ng_1d = node.deltaH;
         S_nonGauss1 += node.deltaH;
 
-        mprintf("leaf node %zu has non-Gaussian negentropy %.6f\n", node.id, node.deltaH);
+        mprintf("node %i:%zu has non-Gaussian negentropy %.6f\n", node.tree_level, node.id, node.deltaH);
+        fflush(stdout);
+	fflush(stderr);
 
-     } else {
+     } 
+
+     //level two or higher "joint" nodes.
+     if( node.tree_level >= 1  ) {
        //parent should have two well-defined childs.   
        //get the difference between joint non-Gaussianness 
        //and separate non-Gaussianness
@@ -1438,20 +1533,24 @@ HD_HEAP_POKE();
 
        //accumulate at the node
        node.S_ng_2d = dS;
-       node.deltaH = node.child1->deltaH + node.child2->deltaH + dS;
 
-       mprintf("level X node %zu has moment entropy %.6f\n", node.id, node.S_ng_2d);
-
+       if ( node.S_ng_1d == 0. ) {
+         S_nonGauss2 += dS;
+       }
+       node.deltaH = dS;
+       mprintf("node %i:%zu has moment entropy %e\n", node.tree_level, node.id, node.S_ng_2d);
+       fflush(stdout);
+       fflush(stderr);
      }
    }
-HD_HEAP_POKE();
 
-
+   mprintf("Raw Schlitter: %.4f moment corrections: %.4f poly-Gauss corrections: %.4f : final %.4f\n",
+         S_schlitter_full, S_nonGauss2, S_nonGauss1, S_schlitter_full -  S_nonGauss1 -  S_nonGauss2);
 
 
    free( xmean );
 
-   return S_schlitter_full;
+   return S_schlitter_full -  S_nonGauss1 -  S_nonGauss2;
 }
 
 
@@ -1645,166 +1744,6 @@ double block_2d_moments_correction(
   return correction;
 }
 
-
-//////////////////////////////////////////////////////////////
-// Central kernel of this approach:
-// Computes NEW non-Gaussian entropy corrections introduced by merging blocks A and B
-// Assumes:
-//   - internal H(A), H(B) already harvested, so individual blocks are now multivariate Gaussians.
-//   - A.dofs and B.dofs are disjoint
-// Returns:
-//   - An entropy correction Sng_merge >= 0.
-//
-// Why are we doing this? Because Schlitter entropy is a good bound for systems which are
-// Gaussian. To tighten the bound, we look at deviations from Gaussian.
-//
-// 1-dof deviations can come from a 1D Shannon entropy, but N-dimensional Shannon is hard.
-//
-// We find the N-body deviations in NlogN merges going up a tree
-// constructed heuristically to harvest the most information at the lowest levels.
-//
-/////
-double sng2_merge_cca(
-  const double* Xc,
-  size_t n_frames,
-  size_t p,
-  const  TreeNode& A,
-  const  TreeNode& B,
-  size_t max_modes,
-  double eps
-) {
-  const size_t   m = A.dofs.size();
-  const size_t   n = B.dofs.size();
-  const size_t* Ad = A.dofs.data();
-  const size_t* Bd = B.dofs.data();
-  if (m == 0 || n == 0)
-    return 0.0;
-
-  //cpptraj linear algebra API
-  //could have lapack or similar under it, depends on compilation.
-  DataSet_MatrixDbl Cwh;
-  DataSet_Modes     modesA, modesB, modesCCA;
-  DataSet_MatrixDbl SigmaAB;
-
-  { //declare a scope to find block second moments.
-    DataSet_MatrixDbl SigmaA, SigmaB;
-    SigmaA.AllocateHalf(m);
-    SigmaB.AllocateHalf(n);
-    SigmaAB.Allocate2D(n, m);
-
-    //build local sub-block matrices.
-    for (size_t f = 0; f < n_frames; ++f) {
-      const size_t fp = f * p;
-      // SigmaA
-      for (size_t i = 0; i < m; ++i) {
-        const double xi = Xc[fp + Ad[i]];
-        for (size_t j = 0; j <= i; ++j)
-          SigmaA.UpdateElement(i, j, xi * Xc[fp + Ad[j]]);
-      }
-
-      // SigmaB
-      for (size_t i = 0; i < n; ++i) {
-        const double xi = Xc[fp + Bd[i]];
-        for (size_t j = 0; j <= i; ++j)
-          SigmaB.UpdateElement(i, j, xi * Xc[fp + Bd[j]]);
-      }
-
-      // SigmaAB
-      for (size_t i = 0; i < m; ++i) {
-        const double xi = Xc[fp + Ad[i]];
-        for (size_t j = 0; j < n; ++j)
-          SigmaAB.UpdateElement(j, i, xi * Xc[fp + Bd[j]]);
-      }
-    }  
-    const double invN = 1.0 / double(n_frames);
-    SigmaA.Normalize(invN);
-    SigmaB.Normalize(invN);
-    SigmaAB.Normalize(invN);
-
-    /* Full eigensystems required for block whitening */
-    modesA.CalcEigen_General(SigmaA);
-    modesB.CalcEigen_General(SigmaB);
-  }
-
-  DataSet_MatrixDbl WA, WB; //need these later.
-  { //open another scope for whitening
-    WA.Allocate2D(m, m);
-    WB.Allocate2D(n, n);
-    for (size_t i = 0; i < m; i++) {
-      double eval      = std::max(modesA.Eigenvalue(i), eps);
-      double scale     = 1.0 / std::sqrt(eval);
-      const double* ei = modesA.Eigenvector(i);
-      for (size_t j = 0; j < m; j++) WA.SetElement(i, j, scale*ei[j]);
-    }
-    for (size_t i = 0; i < n; i++) {
-      double eval = std::max(modesB.Eigenvalue(i), eps);
-      double scale = 1.0 / std::sqrt(eval);
-      const double* ei = modesB.Eigenvector(i);
-      for (size_t j = 0; j < n; j++) WB.SetElement(i, j, scale*ei[j]);
-    }
-
-    /* subscope whitened cross-covariance C = WA * SigmaAB * WB^T */
-    {
-      DataSet_MatrixDbl tmp;
-      tmp.Multiply(WA, SigmaAB);
-      Cwh.Multiply_M2transpose(tmp, WB);
-    }
-  }
-
-  { //open another scope for M
-    DataSet_MatrixDbl M;
-
-    /* Symmetric CCA matrix M = C * C^T */
-    M.AllocateHalf(m);
-    for (size_t i = 0; i < m; i++)
-      for (size_t j = 0; j <= i; j++)
-        for (size_t k = 0; k < n; k++)
-          M.UpdateElement(i, j,
-            Cwh.GetElement(k, i) * Cwh.GetElement(k, j));
-
-    /* Canonical correlations from M */
-    if (max_modes == 0) max_modes = m;
-    modesCCA.CalcEigen(M, max_modes);
-  }
-  const size_t k = modesCCA.Size();
-  if (k == 0)
-    return 0.0;
-
-  /* Residual non-Gaussian invariant */
-  double mean_r4 = 0.0;
-  for (size_t f = 0; f < n_frames; f++) {
-    double r2A = 0.0;
-    double r2B = 0.0;
-
-    for (size_t i = 0; i < m; i++) {
-      double z = 0.0;
-      for (size_t j = 0; j < m; j++)
-        z += WA.GetElement(i, j) * Xc[f * p + A.dofs[j]];
-      r2A += z * z;
-    }
-
-    for (size_t i = 0; i < n; i++) {
-      double z = 0.0;
-      for (size_t j = 0; j < n; j++)
-        z += WB.GetElement(i, j) * Xc[f * p + B.dofs[j]];
-      r2B += z * z;
-    }
-
-    mean_r4 += r2A * r2B;
-  }
-  mean_r4 /= double(n_frames);
-
-  double rho2sum = 0.0;
-  for (size_t i = 0; i < k; i++)
-    rho2sum += modesCCA.Eigenvalue(i);
-
-  double kappa = mean_r4 - (k + 2.0 * rho2sum);
-  if (kappa <= 0.0)
-    return 0.0;
-
-  return kappa / 48.0;
-}
-
 //search over an edge list to find the most
 //promising blocks to merge, and sort
 //by score descending.
@@ -1843,8 +1782,8 @@ compute_mi_candidates_parallel(
         params.eps_pivot
       );
 
-      if (mi <= params.min_mi_gain)
-        continue;
+//   if (mi <= params.min_mi_gain)
+//        continue;
 
       local.emplace_back(A, B, mi);
     }

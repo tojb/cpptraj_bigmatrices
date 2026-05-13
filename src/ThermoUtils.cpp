@@ -237,8 +237,15 @@ int ComputeThermochemistry(CpptrajFile& outfile, const ThermoInput& in, int ilev
     Stot += Svib;
   }
 
-  outfile.Printf("\n\n           freq.         E                  Cv                 S\n");
-  outfile.Printf(    "          cm**-1      kcal/mol        cal/mol-kelvin    cal/mol-kelvin\n");
+  if ( ndof > 0 ) {
+    outfile.Printf("\n\n           freq.         E                  Cv                 S\n");
+    outfile.Printf(    "          cm**-1      kcal/mol        cal/mol-kelvin    cal/mol-kelvin\n");
+  } else {
+    outfile.Printf("\n\n                         E                  Cv                 S\n");
+    outfile.Printf(    "                      kcal/mol        cal/mol-kelvin    cal/mol-kelvin\n");
+  }
+
+
   outfile.Printf(    "--------------------------------------------------------------------------------\n");
   outfile.Printf(    " Total              %11.3f        %11.3f        %11.3f\n", Etot,  Ctot,  Stot);
   outfile.Printf(    " translational      %11.3f        %11.3f        %11.3f\n", Etran, Ctran, Stran);

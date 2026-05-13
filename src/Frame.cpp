@@ -1014,6 +1014,7 @@ void Frame::Align(Frame const& REF, AtomMask const& mask) {
   Matrix_3x3 U;
   Vec3 Trans;
   tmpFrm.RMSD_CenteredRef( tmpRef, U, Trans, false );
+
   Trans_Rot_Trans( Trans, U, refTrans );
 }
 
@@ -1102,15 +1103,15 @@ double Frame::RMSD_CenteredRef( Frame const& Ref, Matrix_3x3& U, Vec3& Trans, bo
   Trans[0] /= total_mass;
   Trans[1] /= total_mass;
   Trans[2] /= total_mass;
-  //mprintf("  FRAME COM: %f %f %f\n",Trans[0],Trans[1],Trans[2]); //DEBUG
+//  mprintf("  FRAME COM: %f %f %f\n",Trans[0],Trans[1],Trans[2]); //DEBUG
 
   // Shift to common COM
   Trans.Neg();
   Translate(Trans);
-  //for (int i = 0; i < natom_; i++) {
-  //  mprinterr("\tSHIFTED FRAME %i: %f %f %f\n",i,X_[i*3],X_[i*3+1],X_[i*3+2]); //DEBUG
-  //  mprinterr("\tSHIFTED REF %i  : %f %f %f\n",i,Ref.X_[i*3],Ref.X_[i*3+1],Ref.X_[i*3+2]); //DEBUG
-  //}
+//  for (int i = 0; i < natom_; i++) {
+//    mprintf("\tSHIFTED FRAME %i: %f %f %f\n",i,X_[i*3],X_[i*3+1],X_[i*3+2]); //DEBUG
+//    mprintf("\tSHIFTED REF %i  : %f %f %f\n",i,Ref.X_[i*3],Ref.X_[i*3+1],Ref.X_[i*3+2]); //DEBUG
+//  }
 
   // Use Kabsch algorithm to calculate optimum rotation matrix.
   // U = [(RtR)^.5][R^-1]
@@ -1146,14 +1147,17 @@ double Frame::RMSD_CenteredRef( Frame const& Ref, Matrix_3x3& U, Vec3& Trans, bo
   }
   mwss *= 0.5;    // E0 = 0.5*Sum(xn^2+yn^2) 
   //DEBUG
-  //mprinterr("ROT:\n%lf %lf %lf\n%lf %lf %lf\n%lf %lf %lf\n",
+  //mprintf("ROT:\n%lf %lf %lf\n%lf %lf %lf\n%lf %lf %lf\n",
   //          rot[0],rot[1],rot[2],rot[3],rot[4],rot[5],rot[6],rot[7],rot[8]);
   //mprinterr("MWSS: %lf\n",mwss);
   // calculate Kabsch matrix multiplied by its transpose: RtR
   Matrix_3x3 Evector = rot.TransposeMult(rot); 
   // Diagonalize
   Vec3 Eigenvalue;
-  if (Evector.Diagonalize_Sort( Eigenvalue )) return 0;
+  if (Evector.Diagonalize_Sort( Eigenvalue )) { 
+     //mprinterr("warning: instability in 3x3 matrix diagonalisation during RMSD_CenteredRef() : returning 0.0\n");
+     return 0.0;
+  }
   // a3 = a1 x a2
   Evector[6] = (Evector[1]*Evector[5]) - (Evector[2]*Evector[4]); 
   Evector[7] = (Evector[2]*Evector[3]) - (Evector[0]*Evector[5]); 
@@ -1204,9 +1208,7 @@ double Frame::RMSD_CenteredRef( Frame const& Ref, Matrix_3x3& U, Vec3& Trans, bo
     rms_return = 0.0;
   } else
     rms_return = sqrt((2.0*rms_return)/total_mass);
-  //DEBUG
-  //printRotTransInfo(U,Trans);
-  //fprintf(stdout,"RMS is %lf\n",rms_return);
+
   return rms_return;
 }
 
