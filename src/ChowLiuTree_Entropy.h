@@ -6,16 +6,56 @@
 #include <queue>
 #include <functional>
 
+
+
 //a convenient matrix accessor (overloaded for const + mutable)
 struct MatrixView {
     double* data;
-    size_t n;
+    size_t     n;
     inline double& operator()(size_t r, size_t c) {
         return data[r*n + c];
     }
     inline const double& operator()(size_t r, size_t c) const {
         return data[r*n + c];
     }
+};
+
+
+//a convenient matrix accessor for non-contiguous access
+struct IndexedMatrixView {
+    double*                     data;
+    size_t                      n; //submatrix size
+    size_t                      stride; //master size.
+    const  std::vector<size_t>& idx;
+
+    //constructor
+    IndexedMatrixView(double* d,
+                      size_t  stride_,
+                      const   std::vector<size_t>& i)
+        : data(d), n(i.size()), stride(stride_), idx(i)
+    {}
+
+    //data access
+    inline double& operator()(size_t r, size_t c) {
+	
+        return data[idx[r]*stride + idx[c]];
+    }
+    inline const double& operator()(size_t r, size_t c) const {
+        return data[idx[r]*stride + idx[c]];
+    }
+};
+
+//quick utility structure to create a dense submatrix
+struct OwnedMatrix {
+  std::vector<double> buf;
+  MatrixView          view;
+
+  explicit OwnedMatrix(size_t n)
+        : buf(n*n, 0.0), view{buf.data(), n} {}
+
+  double& operator()(size_t i, size_t j) {
+        return buf[i*view.n + j];
+  }
 };
 
 //below are more specific data structures for the Chow-Liu algorithm
@@ -39,20 +79,29 @@ typedef struct TreeNode {
     double S_gauss;
     double S_ng_1d;
     double S_ng_2d;
+    double S_shannon;
+    double S_knn;
+    double S_ftknn;
     double deltaH;
+
+    //projected entropy estimators
+    double lowD_S_gauss;
+    double lowD_S_knn;
+    size_t projected_D;
+
 } CLNode;
 
 
 //a convenience structure, for generic graph building.
 struct Edge {
-  const TreeNode *a;
-  const TreeNode *b; // tree nodes
+  TreeNode *a;
+  TreeNode *b; // tree nodes
   double    weight; // a link weight, use as convenient.
 
   //overload constructor.
   Edge() : a(nullptr), b(nullptr), weight(0.0) {}
-  Edge(const TreeNode* a_, const TreeNode* b_) : a(a_), b(b_) {}
-  Edge(const TreeNode* a_, const TreeNode* b_, double w_) : a(a_), b(b_), weight(w_) {}
+  Edge(TreeNode* a_, TreeNode* b_) : a(a_), b(b_) {}
+  Edge(TreeNode* a_, TreeNode* b_, double w_) : a(a_), b(b_), weight(w_) {}
 
 };
 
@@ -162,6 +211,31 @@ std::vector<std::vector<size_t>>
 void greedy_merge_from_candidates(std::vector<TreeNode*>&   active,
                                   const std::vector<Edge>&  candidates); //candidate edges sorted by MI descending
 
+//choose candidates to merge based on a sniff-test of expected MI gain
+void evaluate_merge_JL(
+  const double*              X,
+  const MatrixView&          C_full,
+  size_t                     nframes,
+  size_t                     D_full,
+  CLNode*                    A,
+  CLNode*                    B,
+  size_t                     d_proj,
+  uint64_t                   seed,
+  double&                    delta_MI_shannon,
+  double&                    delta_polygauss,
+  double&                    delta_moments);
+
+//the JL-based scoring is stochastic, so call it a few times to get an average.
+double evaluate_merge_JL_multi(
+  const double*              X,
+  const MatrixView&          C_full,
+  size_t                     nframes,
+  size_t                     D_full,
+  CLNode*                    A,
+  CLNode*                    B,
+  size_t                     nproj,  //number of times to apply a merge and take the mean, variance
+  double&                    mean_delta, //mean
+  double&                    var_delta);  //variance
 
 
 

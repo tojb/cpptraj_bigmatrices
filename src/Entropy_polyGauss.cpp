@@ -198,6 +198,7 @@ bool fit_polyGauss_block(
    This is the part that gets expensive in high dimensions,
    obliging a transition to a moments-based approach (CCA).
   ***********/
+#if 0
   model.Q.assign(d*d*d, 0.0);
   for (size_t f = 0; f < nframes; f++) {
     const double* y = &Y[f*d];
@@ -211,6 +212,7 @@ bool fit_polyGauss_block(
   double scale = 1.0 / double(nframes);
   for (double& v : model.Q)
     v *= scale;
+#endif
 
   /* Entropy correction via Jacobian expectation */
   model.entropy_correction =
@@ -227,6 +229,8 @@ double logdet_from_jacobian_cpptraj(const std::vector<double>& Jflat,
 
   DataSet_MatrixDbl JTJ;
   JTJ.AllocateHalf(d); // symmetric matrix
+
+  #pragma omp parallel for schedule(static)
   for (size_t i = 0; i < d; i++) {
     for (size_t j = 0; j <= i; j++) {
       double sum = 0.0;
@@ -247,13 +251,16 @@ double logdet_from_jacobian_cpptraj(const std::vector<double>& Jflat,
   double logdet = 0.0;
   const double eps = 1.0e-12;
 
+  #pragma omp parallel for reduction(+:logdet)
   for (size_t k = 0; k < d; k++) {
     double lambda = modes.Eigenvalue(k); // lambda = σ_k^2
     if (lambda < eps)
-      return -std::numeric_limits<double>::infinity();
-    logdet += 0.5 * std::log(lambda);
+      logdet = -std::numeric_limits<double>::infinity();
+    else
+      logdet += 0.5 * std::log(lambda);
   }
 
+  if ( !std::isfinite(logdet) ) return -std::numeric_limits<double>::infinity();
   return logdet;
 }
 
@@ -339,10 +346,18 @@ double polyGauss_entropy_correction( const PolyGaussModel& model,
 {
   const size_t d   = model.d;
   double       acc = 0.0;
+  double      invN = 1./nframes;
+
+  std::vector<double> J(d*d);
 
   for (size_t f = 0; f < nframes; f++) {
+    const double *y = &Y[f*d];
+
     /* Build Jacobian J = I + d g / d y */
-    std::vector<double> J(d*d, 0.0);
+    std::fill(J.begin(), J.end(), 0.);
+    
+
+#if 0 //triple loop, memory hog
     for (size_t i = 0; i < d; i++)
       J[i*d + i] = 1.0;
     const double* y = &Y[f*d];
@@ -358,6 +373,28 @@ double polyGauss_entropy_correction( const PolyGaussModel& model,
         J[i*d + j] += s;
       }
     }
+#else
+
+   for( size_t f2 = 0; f2 < nframes; f2++ ){ 
+     const double *y2 = &Y[f2*d];
+     //dot y_f2, y_f
+     double dot_f2 = 0.;
+     for( size_t k = 0; k < d; k++) dot_f2 += y2[k] * y[k];
+
+     //contraction
+     for( size_t i = 0; i < d; i++) {
+       double yi = y2[i];
+       for (size_t j = 0; j < d; j++) {
+         double coeff = (j == i) ? 2.0 : 1.0;  // symmetry 
+         J[i*d + j] += coeff * yi * y2[j] * dot_f2;
+       }
+     }
+   }
+   // normalise
+   for (size_t i = 0; i < d*d; i++)
+     J[i] *= invN;
+
+#endif
 
 
     // Apply a volume stabilisation factor:

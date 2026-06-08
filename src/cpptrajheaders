@@ -280,8 +280,11 @@ CPPTRAJ_HEADERS = \
         ./EnsembleOutList.h \
         ./EnsembleOut_Multi.h \
         ./EnsembleOut_Single.h \
-        ./Entropy_polyGauss.h \
+        ./Entropy_FFT.h \
+        ./Entropy_KnnHistogram.h \
         ./Entropy_Moments.h \
+        ./Entropy_polyGauss.h \
+        ./Entropy_Projections.h \
         ./EwaldOptions.h \
         ./ExclusionArray.h \
         ./Exec_AddMissingRes.h \

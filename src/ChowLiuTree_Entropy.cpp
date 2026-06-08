@@ -17,22 +17,8 @@
 
 #include "ChowLiuTree_Entropy.h"
 #include "Analysis_EntropyHD.h"
-
-#undef  NDEBUG
-#define __DBG
-#ifdef DBG
-#define CL_HEAP_POKE(); do { \
-  void* _p = malloc(16); \
-  if (!_p) abort(); \
-  memset(_p, 0xcc, 16); \
-  free(_p); \
-  fprintf(stderr, "CL @ %s:%d\n", __FILE__, __LINE__); \
-  fflush(stderr); \
-} while(0)
-#else
-#define CL_HEAP_POKE(); 
-#endif
-
+#include "Entropy_Projections.h" //Johnson-Lindenstraus utility code
+#include "Entropy_KnnHistogram.h"
 
 /////////Initialisation:
 //this initialises based on (trivial) data block
@@ -55,10 +41,12 @@ TreeNode* ChowLiuTree::add_leaf_node(const std::vector<size_t>& dofs, size_t id,
   n->dofs = dofs;
    
   //a million definitions of entropy.
-  n->S_ng_1d = 0.0;
-  n->S_ng_2d = 0.0;
-  n->deltaH  = 0.0;
-  n->S_gauss = S_gauss;
+  n->S_ng_1d   = 0.0;
+  n->S_ng_2d   = 0.0;
+  n->S_shannon = 0.0;
+  n->S_knn     = 0.0;
+  n->deltaH    = 0.0;
+  n->S_gauss   = S_gauss;
 
   return n;
 }
@@ -94,6 +82,8 @@ TreeNode* ChowLiuTree::merge(TreeNode* a, TreeNode* b) {
   p->S_ng_1d = 0.0;
   p->S_ng_2d = 0.0;
   p->deltaH  = 0.0;
+  p->S_knn   = 0.0;
+  p->S_shannon = a->S_shannon + b->S_shannon; //additive 1D entropy measure.
 
   return p;
 }
@@ -151,14 +141,14 @@ build_weighted_contact_graph(
      #pragma omp for schedule(dynamic, 16)
      for (size_t i = 0; i < nodes.size() - 1; ++i) {
 
-       const TreeNode *node = nodes[i];
-       const size_t      ai = node->dofs[0]; //
+       TreeNode *node = nodes[i];
+       const size_t  ai = node->dofs[0]; //
 
        std::vector <Edge> nebs;
        nebs.clear();
        for (size_t j = i+1; j < nodes.size(); ++j) {
 
-         const TreeNode* nj = nodes[j];
+         TreeNode* nj    = nodes[j];
          const size_t aj = nj->dofs[0];
 
          //disallow neighbours outside cutoff
@@ -240,8 +230,8 @@ void ChowLiuTree::greedy_merge_from_candidates(
   std::vector<TreeNode*> next_active;
   next_active.reserve(n);
   for (const auto& c : candidates) {
-    auto* a = const_cast<TreeNode*>(c.a); //these pointers are constants until they aren't
-    auto* b = const_cast<TreeNode*>(c.b);
+    TreeNode* a = c.a; 
+    TreeNode* b = c.b;
 
 
     if ( a->state_flag != 0 || b->state_flag != 0 ) {
@@ -263,6 +253,177 @@ void ChowLiuTree::greedy_merge_from_candidates(
   }
   active.swap(next_active);
 }
+
+
+//
+////
+//
+// This is a generalisation of the usual Chow-Liu merge criterion of 
+// maximum mutual information.
+//
+// Here we do a low-dimensional projection using Johnson-Lindenstrauss
+// then estimate the MI gain AND the non-Gaussian mart of the MI gain
+// using the cheap, low-dimensional projected trajectory.
+//
+// Its noisy, so possibly just run three times or something.
+//
+//
+void evaluate_merge_JL(
+  const double*              X,
+  const MatrixView&          C_full,
+  size_t                     nframes,
+  size_t                     D_full,
+  CLNode*                    A,
+  CLNode*                    B,
+  uint64_t                   seed,
+  double&                    delta_MI_knn,
+  double&                    delta_polygauss,
+  double&                    delta_moments )
+{
+  std::vector<double> Y_A;
+  std::vector<double> Y_B;
+  std::vector<double> Y_AB;
+
+  //choose projection dimension based on JL lemma, but also on number of frames:
+  //no point undersampling a large space.
+  size_t d_proj, D;
+
+  D      = A->dofs.size() + B->dofs.size();
+  d_proj = (size_t)(12 + 3.0 * std::log((double)D));        //JL estimate, plus something extra for good luck.
+  if ( d_proj < 6 )  d_proj = 6; //minimum
+
+  //check for undersampling in the given dimension
+  if ( d_proj > (size_t)std::sqrt( nframes ) ) 
+    d_proj = (size_t)std::sqrt( nframes );
+
+  //further, check for "downsampling" that accidentally goes up.
+  if ( d_proj > D ) 
+    d_proj = D;
+
+  // down-project the joint and separate blocks to YA, YB, YAB.
+  downproject_and_split_JL(
+    X, nframes, D_full,
+    A->dofs,
+    B->dofs,
+    d_proj,
+    Y_A, Y_B, Y_AB,
+    seed
+  );
+
+  // Schlitter Entropy (Gaussian baseline) 
+  double S_A_gauss  = jl_schlitter_block(C_full, A->dofs, d_proj, seed); 
+  double S_B_gauss  = jl_schlitter_block(C_full, B->dofs, d_proj, seed);
+  double S_AB_gauss;
+  {
+    //joint Schlitter entropy.
+    std::vector<size_t> dof_AB;
+    dof_AB.reserve(A->dofs.size() + B->dofs.size());
+    dof_AB.insert(dof_AB.end(), A->dofs.begin(), A->dofs.end());
+    dof_AB.insert(dof_AB.end(), B->dofs.begin(), B->dofs.end());
+    S_AB_gauss = jl_schlitter_block(C_full, dof_AB, d_proj, seed);
+  }
+
+  // knn Entropy: seems like a robust entropy estimator at lowish d_proj.
+  size_t k = 6;
+  if ( k < nframes ) k = nframes;
+  double S_A_knn  = knn_entropy_block( Y_A.data(),  nframes, d_proj, k );
+  double S_B_knn  = knn_entropy_block( Y_B.data(),  nframes, d_proj, k );
+  double S_AB_knn = knn_entropy_block( Y_AB.data(), nframes, d_proj, k );
+
+  // Optional / debug: do some higher order estimators on the projected data.
+  //double S_A_poly  = polygauss_entropy(Y_A,  nframes, d_proj);
+  //double S_B_poly  = polygauss_entropy(Y_B,  nframes, d_proj);
+  //double S_AB_poly = polygauss_entropy(Y_AB, nframes, d_proj);
+
+  //double S_A_mom  = moments_entropy(Y_A,  nframes, d_proj);
+  //double S_B_mom  = moments_entropy(Y_B,  nframes, d_proj);
+  //double S_AB_mom = moments_entropy(Y_AB, nframes, d_proj);
+
+  // Gaussian (Schlitter) merge baseline 
+  double delta_gauss = S_AB_gauss - S_A_gauss - S_B_gauss;
+
+  // Shannon merge 
+  double delta_knn = S_AB_knn - S_A_knn - S_B_knn;
+
+  // Provisionally, use this metric to guide the tree merge.
+  delta_MI_knn = delta_knn - delta_gauss;
+
+  // Diagnostics: NonGaussian terms in the projected space.
+  //double dA_poly  = S_A_poly  - S_A_gauss;
+  //double dB_poly  = S_B_poly  - S_B_gauss;
+  //double dAB_poly = S_AB_poly - S_AB_gauss;
+
+  //double dA_mom  = S_A_mom  - S_A_gauss;
+  //double dB_mom  = S_B_mom  - S_B_gauss;
+  //double dAB_mom = S_AB_mom - S_AB_gauss;
+
+  //delta_polygauss = dAB_poly - dA_poly - dB_poly;
+  //delta_moments   = dAB_mom  - dA_mom  - dB_mom;
+
+  // store some information per-node.
+  A->lowD_S_gauss   = S_A_gauss;
+  A->lowD_S_knn     = S_A_knn;
+  A->projected_D    = d_proj;
+
+  B->lowD_S_gauss   = S_B_gauss;
+  B->lowD_S_knn     = S_B_knn;
+  B->projected_D    = d_proj;
+
+}
+
+double evaluate_merge_JL_multi(
+  const double*              X,
+  const MatrixView&          C_full,
+  size_t                     nframes,
+  size_t                     D_full,
+  CLNode*                    A,
+  CLNode*                    B,
+  size_t                     nproj,  //number of times to apply a merge and take the mean, variance
+  double&                    mean_delta, //mean
+  double&                    var_delta)  //variance
+{
+  double sum  = 0.0;
+  double sum2 = 0.0;
+
+  // OpenMP reduction over projections
+  #pragma omp parallel for reduction(+:sum,sum2)
+  for (size_t p = 0; p < nproj; p++) {
+
+    // deterministic seed per projection
+    uint64_t seed =
+        ((uint64_t)A->id * 1315423911ULL)
+      ^ ((uint64_t)B->id * 2654435761ULL)
+      ^ (uint64_t)p;
+
+    double delta_MI_knn;
+    double delta_poly;
+    double delta_mom;
+
+    evaluate_merge_JL(
+        X, C_full, nframes, D_full,
+        A, B,
+        seed,
+        delta_MI_knn,
+        delta_poly,
+        delta_mom );
+
+    sum  += delta_MI_knn;
+    sum2 += delta_MI_knn * delta_MI_knn;
+  }
+
+  mean_delta = sum  / (double)nproj;
+  var_delta  = sum2 / (double)nproj - mean_delta * mean_delta;
+
+  if (var_delta < 0.0) var_delta = 0.0;
+
+  // default score: signal-to-noise ratio
+  double score = mean_delta / (std::sqrt(var_delta) + 1e-8);
+
+  return score;
+}
+
+
+
 
   
 //debug printout.

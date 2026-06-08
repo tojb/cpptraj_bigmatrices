@@ -3,6 +3,8 @@
 
 #include "Analysis.h"
 #include "ArgList.h"
+#include "CpptrajStdio.h"
+#include "DataSet_1D.h"
 #include "DataSet_MatrixDbl.h"
 #include "DataSet_Coords.h"
 #include "AtomMask.h"
@@ -12,12 +14,24 @@
 //based on variance/covariance of a pair of matrix 
 //blocks.
 struct MatrixView;
+struct IndexedMatrixView;
+
+
+
 double mutual_information_logdet(
     const MatrixView& Cfull,
     const std::vector<size_t>& A,
     const std::vector<size_t>& B,
     bool verbose = false,
     double eps_pivot = 1e-12);
+
+//function to calculate (dimensionless) entropy of a submatrix indexed by dof
+double block_entropy_logdet(
+    const MatrixView&          Cfull, //full covariance
+    const std::vector<size_t>& dof,   //indices of dof to use
+    bool                       verbose   = false,
+    double                     eps_pivot = 1e-12);
+
 
 class Analysis_EntropyHD : public Analysis {
 public:
@@ -83,5 +97,6 @@ private:
 	  return p; 
   }
 };
+
 
 #endif

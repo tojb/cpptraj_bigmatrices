@@ -25,6 +25,7 @@
 // we here compute the same quantity without any eigensolve by switching to a frame‑space
 // Gram formulation and a small Cholesky log‑det. 
 // This is mathematically justified by Sylvester’s determinant identity: 
+// 
 //  det⁡ ⁣(IP+α XcTXc)  =  det⁡ ⁣(IN+α XcXcT)\det\!\big(IP_ + \alpha\,X_c^{\mathsf T}X_c\big) \;=\;
 //                \det\!\big(I_N + \alpha\,X_cX_c^{\mathsf T}\big)det(IP​+αXcT​Xc​)
 //                =det(IN​+αXc​XcT​)
@@ -41,13 +42,6 @@
 // Deltas of entropy between different states or conditions should be
 // comparable across both methods, however, since the different fudge factors 
 // employed to avoid taking log of zero or negative eigenvalues should largely cancel out. 
-//
-// The "fudge factor" in the QHO formula is a constant added to the eigenvalues,
-// with some physical justification, 
-// while the "fudge factor" in the Schlitter formula is a constant multiplied by the covariance matrix, 
-// with an unclear physical justification if any, so they are not directly comparable, 
-// but both serve to regularize the entropy estimate.
-//
 // The advanced feature here is the Harris–Dryden bias correction, 
 // which fits the observed S(n) to the empirical scaling form S(n) = S0 + m * n^{-a} 
 // and extrapolates as n→∞ to get S0, which is a less biased estimate of the true configurational entropy.
@@ -99,6 +93,8 @@
 #include "ChowLiuTree_Entropy.h"
 #include "Entropy_polyGauss.h"
 #include "Entropy_Moments.h"
+#include "Entropy_KnnHistogram.h"
+#include "Entropy_FFT.h"
 
 //this is a convenient debug macro to test heap integrity.
 #define __DBG
@@ -116,7 +112,7 @@
 #endif
 
 
-#define SANITIZE_INPUT_COORDS
+#define _SANITIZE_INPUT_COORDS
 
 //local function(s) not exposed:
 //
@@ -127,13 +123,15 @@ static double greedy_pivoted_cholesky_logdet( MatrixView& A, bool verbose = fals
 double block_1d_negentropy_correction(const double* Xc, size_t n_frames,  size_t p, const std::vector<size_t>& block_dofs );
 double histogram_entropy_1d(const double* x, size_t n, double mean, double var ); //1D histogram for Shannon entropy.
 
+
 std::vector<Edge>
 compute_mi_candidates_parallel(const MatrixView&              C,
+                               const double*                  X,
+                               size_t                         n_frames,
+                               size_t                         D_full,
                                const std::vector<TreeNode*>&  active,//search these nodes.
                                const std::vector<Edge>&       edges, //search these edges.
                                const MergeParams&             P);
-
-
 
 
 //2D entropy correction based on moments (Kurtosis) applied to a single graph edge
@@ -141,8 +139,8 @@ compute_mi_candidates_parallel(const MatrixView&              C,
 double block_2d_moments_correction(const double* Xc,
                                    size_t        n_frames,
                                    size_t        p,
-                                   const         TreeNode*             u,
-				   const         TreeNode*             v);
+                                   TreeNode*     u,
+				   TreeNode*     v);
 
 static constexpr double kB   = 0.00198720425864083;   //kcal/mol/K
 static constexpr double hbar = 0.0635078          ;   //kcal*ps/mol   
@@ -751,7 +749,7 @@ void Analysis_EntropyHD::BuildAlignedCoordinates(
     // -----------------------------------------------------------
     Coords_->GetFrame(0, ref, mask_);
 
- #ifdef SANITIZE_INPUT_COORDS
+#ifdef SANITIZE_INPUT_COORDS
   mprintf("setting reference frame out of %zu at input\n", nFrames);
   for (size_t j = 0; j < nSel; j++) {
     mprintf("at %zu of %i %.3f %.3f %.3f\n", j, nSel, ref.XYZ(j)[0],  ref.XYZ(j)[1], ref.XYZ(j)[2] );
@@ -1060,18 +1058,7 @@ static void diag_report(const MatrixView& A, const char* tag) {
 }
 
 
-//quick utility structure to create a dense submatrix
-struct OwnedMatrix {
-  std::vector<double> buf;
-  MatrixView view;
 
-  explicit OwnedMatrix(size_t n)
-        : buf(n*n, 0.0), view{buf.data(), n} {}
-
-  double& operator()(size_t i, size_t j) {
-        return buf[i*view.n + j];
-  }
-};
 
 //utility function copy a submatrix from
 //a larger matrix and return the copy as an
@@ -1091,17 +1078,17 @@ OwnedMatrix extract_subcov(
 }
 
 
-
 //wrapper for Cholesky det calculation:
 //pass a covariance matrix and a vector of DOF indices
 double block_entropy_logdet(
-    const MatrixView& Cfull,
-    const std::vector<size_t>& dof,
-    bool verbose = false,
-    double eps_pivot = 1e-12)
+    const  MatrixView& Cfull,
+    const  std::vector<size_t>& dof,
+    bool   verbose,
+    double eps_pivot)
 {
   //copy-out a dense submatrix to work with.
   OwnedMatrix C = extract_subcov(Cfull, dof);
+
 
   // greedy_pivoted_cholesky_logdet overwrites C.view
   return greedy_pivoted_cholesky_logdet(C.view, verbose, eps_pivot);
@@ -1374,7 +1361,6 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
         C(i,j) = sum;
       }
     }
-    free( xcmw ); //free up some memory.
 
     // symmetrise and scale 
     double scaled_inv = alpha / double(n-1);
@@ -1406,14 +1392,22 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
 
     //and start building a tree structure which owns the blocks.
     ChowLiuTree CLtree;
-    double S_level = 0.0;
-    for (size_t a = 0; a < p; a += 3) {
-      double my_S;
-      my_S     = block_entropy_logdet(C, {a, a+1, a+2}, false, eps_pivot);
-      S_level += my_S;
-      CLtree.add_leaf_node( {a, a+1, a+2}, a / 3, my_S );
-    }
-    mprintf( "sum of per atom: %.6f\n", S_level );
+    double              S_level = 0.0;
+    {
+      std::vector<double> leaf_entropy(p/3);
+      #pragma omp parallel for reduction(+:S_level)
+      for (size_t a = 0; a < p; a += 3) {
+        double my_S = block_entropy_logdet(C, {a, a+1, a+2}, false, eps_pivot);
+        S_level          += my_S;
+        leaf_entropy[a/3] = my_S;
+      }
+      mprintf( "sum of per atom: %.6f\n", S_level );
+
+      // save entropies into the tree.
+      for (size_t a = 0; a < p; a += 3) {
+        CLtree.add_leaf_node({a, a+1, a+2}, a/3, leaf_entropy[a/3]);
+      }
+    } //de-scope the vector that was storing entropies.
 
     double r_cut      = 8.0;
     double w_min      = 0.05;
@@ -1425,14 +1419,24 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
     MergeParams merge_params; //just init CL construction with defaults for now.
 
     //build a list of edges (node pairs) which are actually targeted for merging.
-    std::vector<Edge> edges = build_weighted_contact_graph(active, xmean, p / 3, C, r_cut, w_min);
+    ///std::vector<Edge> edges = build_weighted_contact_graph(active, xmean, p / 3, C, r_cut, w_min);
+
+    //level zero graph construction should be cheap, so just run it N^2 times. Next level will be N/4.
+    std::vector<Edge> edges;
+    edges.reserve( ( active.size() * ( active.size() + 1 ) ) / 2 );
+    for ( size_t i_node = 1; i_node < active.size(); i_node += 1 ){
+       for ( size_t j_node = 0; j_node < i_node; j_node += 1 ){
+          edges.push_back( Edge( &CLtree.nodes()[i_node], &CLtree.nodes()[j_node], 0. ) );
+       }
+    }
 
     int iter_count = 0;
     while( active.size() > 1 ) {
 
-      // Pairwise MI calculation is here./////////////////////////////
-      auto candidates = compute_mi_candidates_parallel(C, active, edges, merge_params);
-       
+      // Approx pairwise MI calculation is here. Also, make an approximate negentropy////////////
+      auto candidates = compute_mi_candidates_parallel(C, Xc, n, p, active, edges, merge_params);
+      ///////////////////////////////////////////////////////////////////////////////////////////
+
       //define new nodes by merging those with largest pairwise MI.
       //consumes candidate pairs (based on edges) and adds n/2 new nodes back to "active".
       CLtree.greedy_merge_from_candidates( active, candidates );
@@ -1456,13 +1460,13 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
    Cv.clear(); //C was a view onto Cv.
    Cv.shrink_to_fit(); //substantial memory to free. 
 
-   CLtree.debug_print_tree();
+//   CLtree.debug_print_tree();
 
    //1D entropy correction: Shannon entropy of individual DOF  
    double S_nonGauss1 = 0.0;
    double S_nonGauss2 = 0.0;
 
- #ifdef _SANITIZE_INPUT_COORDS
+#ifdef SANITIZE_INPUT_COORDS
   double max_abs_mean = 0.0;
   size_t argmax = 0;
   for (size_t j = 0; j < p; j++) {
@@ -1482,17 +1486,33 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
      TreeNode& node = CLtree.nodes()[i_node];
 
     
-    if ( node.tree_level <= 2 ) {
+    if ( node.tree_level <= 0 ) {
       const std::vector<size_t>& block_dofs = node.dofs; 
       double S_shannon = block_1d_negentropy_correction( Xc, n,   block_dofs.size(),  block_dofs );
 
-      mprintf("node %i:%zu Shannon negentropy J = %.6e\n", node.tree_level, node.id, S_shannon );
+      node.S_shannon = S_shannon;
+  //    mprintf("node %i:%zu Shannon negentropy J = %.6e\n", node.tree_level, node.id, S_shannon );
+    }
+
+    if ( node.tree_level <= 0 ) {
+      const std::vector<size_t>& block_dofs = node.dofs;
+      double S_knn = block_1d_negentropy_correction( Xc, n,   block_dofs.size(),  block_dofs );
+
+      node.S_knn = S_knn;
+  //    mprintf("node %i:%zu kNN negentropy J = %.6e\n", node.tree_level, node.id, S_knn );
+    }
+
+    if ( node.tree_level <= 0 ) {
+      const std::vector<size_t>& block_dofs = node.dofs;
+      double S_ftknn = 	fft_knn_block( C, block_dofs, xcmw, n, p, 8 );
+      node.S_ftknn = S_ftknn;
+  //    mprintf("node %i:%zu kNN negentropy J = %.6e\n", node.tree_level, node.id, S_knn );
     }
 
 
 
-     //efficiency: only get polyGauss at first two tree levels.
-     if ( node.tree_level <= 3 ) {
+     //efficiency: only get polyGauss at first few tree levels?
+     if ( node.tree_level <= 6 ) {
         size_t d = node.dofs.size(); //should be 3, but stay flexible
 
 	//leaf node (3 DOF) gets a nice polynomial-Gaussian entropy correction.
@@ -1516,39 +1536,75 @@ double Analysis_EntropyHD::Stable_Schlitter_LogDet(
         node.S_ng_1d = node.deltaH;
         S_nonGauss1 += node.deltaH;
 
-        mprintf("node %i:%zu has non-Gaussian negentropy %.6f\n", node.tree_level, node.id, node.deltaH);
-        fflush(stdout);
-	fflush(stderr);
+//        mprintf("node %i:%zu has non-Gaussian negentropy %.6f\n", node.tree_level, node.id, node.deltaH);
+//        fflush(stdout);
+//	fflush(stderr);
 
      } 
+   }
 
-     //level two or higher "joint" nodes.
-     if( node.tree_level >= 1  ) {
-       //parent should have two well-defined childs.   
-       //get the difference between joint non-Gaussianness 
-       //and separate non-Gaussianness
+   //This loop potentially expensive, especially for higher levels.
+   //
+   //
+//   #pragma omp parallel
+   {
+     //Declare a workspace: per-thread memory use, needs to be
+     //tracked carefully as this goes as dofs**2.
+     MomentsWorkspace ws;
 
-       double dS = sng2_merge_cca( 
-		       Xc, n, p, *(node.child1), *(node.child2), 0 );
+     for (size_t i_node = 0; i_node < CLtree.nodes().size(); i_node+=1 ) {
+       TreeNode& node = CLtree.nodes()[i_node];
+       //moments entropy should be stable for higher level nodes
+       if( node.tree_level >= 1  ) {
+         //parent should have two well-defined childs.   
+         //get the difference between joint non-Gaussianness 
+         //and separate non-Gaussianness
+         if ( node.child1 == nullptr || node.child2 == nullptr )
+	   continue;
+       
+         //allocate/reallocate node workspaces.
+	 ws.allocate(node.child1->dofs.size() , node.child2->dofs.size() );
 
-       //accumulate at the node
-       node.S_ng_2d = dS;
+         //get the entropy correction 
+         double dS = sng2_merge_cca( 
+		       Xc, n, p, *(node.child1), *(node.child2), 0, ws );
 
-       if ( node.S_ng_1d == 0. ) {
-         S_nonGauss2 += dS;
+         //accumulate at the node
+         node.S_ng_2d = dS;
+
+         if ( node.S_ng_1d == 0. ) {
+           S_nonGauss2 += dS;
+         }
+         node.deltaH = dS;
        }
-       node.deltaH = dS;
-       mprintf("node %i:%zu has moment entropy %e\n", node.tree_level, node.id, node.S_ng_2d);
-       fflush(stdout);
-       fflush(stderr);
      }
    }
 
    mprintf("Raw Schlitter: %.4f moment corrections: %.4f poly-Gauss corrections: %.4f : final %.4f\n",
          S_schlitter_full, S_nonGauss2, S_nonGauss1, S_schlitter_full -  S_nonGauss1 -  S_nonGauss2);
 
-
    free( xmean );
+   free( xcmw );
+
+   //save per-node tree data to files for plotting. TODO: plug all this into cpptraj's DataSet_1D infrastructure etc.
+   FILE *f;
+   {
+     char fileName[128];
+     sprintf( fileName, "entropyTreeData_%06zu.txt", n );
+     f = fopen( fileName, "w");
+   }
+   fprintf(f, "#tree_level node_id Sgauss Sshannon SpolyGauss Smoments Sftknn ats..\n");
+   for (size_t i_node = 0; i_node < CLtree.nodes().size(); i_node+=1 ) {
+     TreeNode& node = CLtree.nodes()[i_node];
+     fprintf(f, "%i %i %.3f %.3f %.3f %.3f", node.tree_level, node.id, node.S_gauss, node.S_shannon, node.S_ng_1d, node.S_ng_2d, node.S_ftknn );
+     for ( size_t iii = 0; iii < node.dofs.size(); iii++ ){
+       size_t ddd = node.dofs[iii];
+       if ( ddd % 3 == 0 ){ fprintf(f, " %zu", ddd/3); }
+     }
+     fprintf(f, "\n");
+   }
+   fclose(f);
+
 
    return S_schlitter_full -  S_nonGauss1 -  S_nonGauss2;
 }
@@ -1673,11 +1729,11 @@ double histogram_entropy_1d(const double* x, size_t n, double mean, double var )
 // Tree-guided 2D moment (cross-kurtosis) correction.
 // Returns a NON-NEGATIVE entropy correction to SUBTRACT.
 double block_2d_moments_correction(
-  const double*                          Xc,           // n_frames × p
-  size_t                                 n_frames,
-  size_t                                 p,
-  const TreeNode*                        u,
-  const TreeNode*                        v ){
+  const double*                    Xc,           // n_frames × p
+  size_t                           n_frames,
+  size_t                           p,
+  TreeNode*                        u,
+  TreeNode*                        v ){
 
  
   constexpr double eps  = 1e-14;
@@ -1750,6 +1806,9 @@ double block_2d_moments_correction(
 std::vector<Edge>
 compute_mi_candidates_parallel(
   const MatrixView&              Cfull,
+  const double*                  X,
+  size_t                         n_frames,
+  size_t                         D_full,
   const std::vector<TreeNode*>&  active,
   const std::vector<Edge>&       edges,
   const MergeParams&             params
@@ -1767,25 +1826,30 @@ compute_mi_candidates_parallel(
     for (size_t e = 0; e < edges.size(); ++e) {
 
       const Edge& edge = edges[e];
-      const TreeNode* A = edge.a;
-      const TreeNode* B = edge.b;
+      TreeNode*      A = edge.a;
+      TreeNode*      B = edge.b;
 
       // Defensive: should not happen, but cheap
       if (!A || !B) continue;
 
       // Mutual information for two blocks
-      double mi = mutual_information_logdet(
-        Cfull,
-        A->dofs,
-        B->dofs,
-        /*verbose=*/false,
-        params.eps_pivot
-      );
+      //
+      // this is the classic Chow-Liu tree building measure
+      //double mi = mutual_information_logdet( Cfull, A->dofs, B->dofs,  /*verbose=*/false, params.eps_pivot );
+      
+      // building in a greedy way based on anharmonic negentropy, which is what we actually want to measure?
+      double mean_mi_gain;
+      double var_mi_gain;
+      int    n_proj = 8; // repeat n times and get the average: JL is stochastic
+      double score =\
+	  evaluate_merge_JL_multi( X, Cfull, n_frames, D_full, A, B, n_proj, mean_mi_gain, var_mi_gain);
 
 //   if (mi <= params.min_mi_gain)
 //        continue;
 
-      local.emplace_back(A, B, mi);
+      local.emplace_back(A, B, score);
+
+
     }
   }
 

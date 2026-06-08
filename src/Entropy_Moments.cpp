@@ -23,21 +23,21 @@
 // constructed heuristically to harvest the most information at the lowest levels.
 //
 /////
-double sng2_merge_cca(const double* Xc,
-	              size_t        n_frames, 
-		      size_t        p,
-                      const         TreeNode& A, 
-		      const         TreeNode& B,
-                      size_t        max_modes)
+double sng2_merge_cca(const double*     Xc,
+                      size_t            n_frames,
+                      size_t            p,
+                      TreeNode&         A,
+                      TreeNode&         B,
+                      size_t            max_modes,
+                      MomentsWorkspace& ws)
 {
   const size_t m = A.dofs.size();
   const size_t n = B.dofs.size();
   if (m == 0 || n == 0 || n_frames == 0) return 0.0;
 
-  DataSet_MatrixDbl SigmaA, SigmaB, SigmaAB;
-  SigmaA.AllocateHalf(m);
-  SigmaB.AllocateHalf(n);
-  SigmaAB.Allocate2D(m, n);
+  DataSet_MatrixDbl& SigmaA  = ws.SigmaA;
+  DataSet_MatrixDbl& SigmaB  = ws.SigmaB;
+  DataSet_MatrixDbl& SigmaAB = ws.SigmaAB;
 
   /* Build second-moment blocks. */
   for (size_t f = 0; f < n_frames; ++f) {
@@ -50,25 +50,27 @@ double sng2_merge_cca(const double* Xc,
   NormalizeSecondMoments(SigmaA, SigmaB, SigmaAB, n_frames);
 
   /* Eigenstuff used to construct whiteners. */
-  DataSet_Modes modesA, modesB, modesCCA;
+  DataSet_Modes& modesA   = ws.modesA;
+  DataSet_Modes& modesB   = ws.modesB;
+  DataSet_Modes& modesCCA = ws.modesCCA;
+
   modesA.CalcEigen_General(SigmaA);
   modesB.CalcEigen_General(SigmaB);
 
   /* Truncated whiteners:  drop collapsed dimensions from the analysis.*/
-  DataSet_MatrixDbl WA, WB;
-  const size_t mEff = BuildWhitenerTrunc(WA, modesA, m);
-  const size_t nEff = BuildWhitenerTrunc(WB, modesB, n);
+  
+  const size_t mEff = BuildWhitenerTrunc(m, ws.modesA, ws.WA, ws);
+  const size_t nEff = BuildWhitenerTrunc(n, ws.modesB, ws.WB, ws);
   if (mEff == 0 || nEff == 0) return 0.0;
-
-  DataSet_MatrixDbl Cwh;
-  BuildWhitenedCrossCov(Cwh, WA, SigmaAB, WB, mEff, nEff);
-
-  DataSet_MatrixDbl M;
-  BuildCCAMatrixHalf(M, Cwh, mEff, nEff);
+  
+  BuildWhitenedCrossCov(mEff, nEff, ws);
+  
+  BuildCCAMatrixHalf(ws, mEff, nEff);
 
   if (max_modes == 0) max_modes = mEff;
   if (max_modes > mEff) max_modes = mEff;
-  modesCCA.CalcEigen(M, max_modes);
+ 
+  modesCCA.CalcEigen(ws.Mhalf, max_modes);
 
   /* Validity/stability checks for the CCA eigenvalues. */
   double rho2sum = 0.0, maxRho2 = 0.0;
@@ -80,13 +82,24 @@ double sng2_merge_cca(const double* Xc,
   if (k == 0) return 0.0;
 
   /* Fourth-moment invariant in whitened coordinates. */
-  const double mean_r4 = MeanR4Product(WA, mEff, WB, nEff, Xc, n_frames, p,
-                                       A.dofs.data(), m, B.dofs.data(), n);
+  // ...first, get second moments
+  const double mean_r2A = MeanR2Block(ws.WA, mEff, Xc, n_frames, p, A.dofs.data(), m);
+  const double mean_r2B = MeanR2Block(ws.WB, nEff, Xc, n_frames, p, B.dofs.data(), n);
 
-  const double gauss = double(k) + 2.0 * rho2sum;
-  const double kappa = mean_r4 - gauss;
-  if (kappa <= 0.0) return 0.0;
+  // Compute raw fourth moment
+  const double mean_r4 = MeanR4Product(ws.WA, mEff, ws.WB, nEff, Xc, n_frames, p, A.dofs.data(), m, B.dofs.data(), n);
 
+  // Convert to connected (covariance) estimator correction relative to second-order terms.
+  const double connected_r4 = mean_r4 - mean_r2A * mean_r2B;
+
+  // Subtract Gaussian expectation also
+  const double kEff = static_cast<double>(modesCCA.Size());
+  if (kEff == 0.0) return 0.0;
+  const double kappa = connected_r4 - (2.0 * rho2sum / kEff);
+
+  if (!std::isfinite(kappa)) return 0.0;
+//  if (kappa <= 0.0) return 0.0; don't introduce bias by clipping (non-physical) neg values.
+  
   return kappa / 48.0;
 }
 
